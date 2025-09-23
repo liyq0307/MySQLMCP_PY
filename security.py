@@ -14,18 +14,15 @@ MySQL MCP安全验证与审计系统 - 企业级安全防护体系
 """
 
 import re
-import hashlib
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 from enum import Enum
 
 from typeUtils import (
-    ValidationLevel, ErrorSeverity, MySQLMCPError, ErrorCategory,
-    SecurityThreat, SecurityThreatAnalysis
+    ValidationLevel, ErrorSeverity, MySQLMCPError, ErrorCategory
 )
 from mysql_manager import MySQLManager
 from rbac import rbac_manager
-from logger import security_logger, structured_logger
 
 
 class SecurityPatternType(str, Enum):

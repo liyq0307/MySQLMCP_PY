@@ -16,33 +16,25 @@ MySQL 高级备份和导出工具
 import asyncio
 import gzip
 import hashlib
-import os
-import shutil
-import subprocess
-import tempfile
 import time
-import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Callable, Literal
+from typing import Any, Dict, List, Optional
 import pandas as pd
 import openpyxl
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill
 
 from mysql_manager import MySQLManager
-from cache import CacheManager, CacheRegion
+from cache import CacheRegion
 from error_handler import ErrorHandler
-from logger import structured_logger, security_logger
+from logger import structured_logger
 from memory_monitor import MemoryMonitor
 from typeUtils import (
     BackupOptions, BackupResult, ExportOptions, ExportResult,
     ReportConfig, IncrementalBackupOptions, IncrementalBackupResult,
-    ProgressTracker, CancellationToken, RecoveryStrategy,
-    ErrorRecoveryResult, LargeFileOptions, ProgressInfo,
-    TaskQueue, BackupVerificationResult, MemoryUsage,
-    ErrorCategory, MySQLMCPError
+    ProgressTracker, TaskQueue, BackupVerificationResult, ErrorCategory, MySQLMCPError
 )
 
 

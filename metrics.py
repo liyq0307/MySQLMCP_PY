@@ -13,11 +13,8 @@ MySQL企业级性能监控系统 - 时序指标收集与智能告警中心
 @license MIT
 """
 
-import psutil
-import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Callable, Union
-from enum import Enum
+from typing import Any, Dict, List, Optional, Callable
 
 from .typeUtils import ErrorSeverity
 from .logger import logger

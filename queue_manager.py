@@ -17,7 +17,7 @@ from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Literal
 from dataclasses import dataclass, field
 
-from typeUtils import QueueTask, QueueStats, QueueConfig, ProgressInfo
+from typeUtils import QueueTask, QueueStats, QueueConfig
 from logger import structured_logger
 
 

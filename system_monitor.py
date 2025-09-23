@@ -14,7 +14,6 @@ MySQL企业级系统监控中心 - 内存管理与性能资源监控系统
 """
 
 import psutil
-import gc
 import time
 import threading
 from datetime import datetime

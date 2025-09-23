@@ -17,14 +17,12 @@ import json
 import logging
 import re
 import hashlib
-from typing import Dict, Any, Optional, List, Generic, TypeVar, Iterator, Union, Tuple
+from typing import Dict, Any, Optional, List, Generic, TypeVar, Iterator, Union
 from datetime import datetime, timedelta
 import threading
 import weakref
 from enum import Enum
-import os
 import psutil
-import gc
 
 logger = logging.getLogger(__name__)
 

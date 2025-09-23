@@ -14,13 +14,10 @@
 
 import json
 import logging
-import asyncio
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable, Union
 from enum import Enum
-from pathlib import Path
 
-from ..typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
 
 
 class LogLevel(str, Enum):

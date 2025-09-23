@@ -19,12 +19,11 @@ from typing import List, Dict, Any, Optional
 import hashlib
 
 from typeUtils import (
-    Permission, PermissionInfo, Role, User, Session,
+    PermissionInfo, Role, User, Session,
     SecurityThreat, SecurityThreatAnalysis, ErrorCategory
 )
-from error_handler import ErrorHandler
-from logger import structured_logger, security_logger
-from types import MySQLMCPError
+from logger import logger, security_logger
+from typeUtils import MySQLMCPError
 
 
 class RBACManager:
@@ -47,17 +46,17 @@ class RBACManager:
     def add_role(self, role: Role) -> None:
         """添加角色"""
         self.roles[role.id] = role
-        structured_logger.info("Role added", {"role_id": role.id, "role_name": role.name})
+        logger.info("Role added", {"role_id": role.id, "role_name": role.name})
 
     def add_user(self, user: User) -> None:
         """添加用户"""
         self.users[user.id] = user
-        structured_logger.info("User added", {"user_id": user.id, "username": user.username})
+        logger.info("User added", {"user_id": user.id, "username": user.username})
 
     def add_permission(self, permission: PermissionInfo) -> None:
         """添加权限"""
         self.permissions[permission.id] = permission
-        structured_logger.debug("Permission added", {"permission_id": permission.id, "name": permission.name})
+        logger.debug("Permission added", {"permission_id": permission.id, "name": permission.name})
 
     def assign_role_to_user(self, user_id: str, role_id: str) -> None:
         """为用户分配角色"""
@@ -94,7 +93,7 @@ class RBACManager:
             role.permissions.append(permission_id)
             role.updated_at = datetime.now()
 
-        structured_logger.info("Permission assigned to role", {
+        logger.info("Permission assigned to role", {
             "role_id": role_id,
             "permission_id": permission_id,
             "role_name": role.name,
@@ -119,7 +118,7 @@ class RBACManager:
         if parent_role_id not in parents:
             parents.append(parent_role_id)
 
-        structured_logger.info("Role inheritance set", {
+        logger.info("Role inheritance set", {
             "child_role": child_role_id,
             "parent_role": parent_role_id,
             "child_name": child_role.name,
@@ -374,7 +373,7 @@ class RBACManager:
         if not self.get_user_by_id('user'):
             self.add_user(default_user)
 
-        structured_logger.info("RBAC default configuration initialized", {
+        logger.info("RBAC default configuration initialized", {
             "roles_count": len(self.roles),
             "users_count": len(self.users),
             "permissions_count": len(self.permissions)

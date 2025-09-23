@@ -12,28 +12,23 @@ MySQL 数据导入工具 - 企业级数据导入解决方案
 @license MIT
 """
 
-import asyncio
 import csv
-import hashlib
 import json
-import os
 import re
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Callable, Literal
+from typing import Any, Dict, List, Optional
 import pandas as pd
 
 from mysql_manager import MySQLManager
-from cache import CacheManager, CacheRegion
 from error_handler import ErrorHandler
-from logger import structured_logger, security_logger
-from types import (
+from logger import structured_logger
+from typeUtils import (
     ImportOptions, ImportResult, ValidationResult, FieldMapping,
-    ImportProgress, DuplicateCheckConfig, DuplicateCacheItem,
-    CandidateKey, ColumnDefinition, TableSchemaInfo,
-    FieldValidation, ErrorCategory, MySQLMCPError
+    DuplicateCheckConfig, DuplicateCacheItem,
+    CandidateKey, TableSchemaInfo,
+    ErrorCategory, MySQLMCPError
 )
 
 

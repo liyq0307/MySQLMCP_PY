@@ -13,8 +13,7 @@
 """
 
 import asyncio
-import time
-from typing import Callable, Any, Optional
+from typing import Any, Optional
 import psutil
 import gc
 

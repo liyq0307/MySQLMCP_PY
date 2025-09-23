@@ -12,7 +12,7 @@ MySQL MCP错误处理与智能分析系统
 @license MIT
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 from .typeUtils import ErrorCategory, ErrorSeverity, ErrorContext, MySQLMCPError
 
 

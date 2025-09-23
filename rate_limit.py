@@ -16,7 +16,6 @@ MySQL企业级智能限流系统 - 令牌桶与自适应流量控制中心
 import time
 from typing import Dict, Optional, Any
 from datetime import datetime, timedelta
-import psutil
 from typeUtils import RateLimitConfig, RateLimitStatus
 
 

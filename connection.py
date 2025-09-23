@@ -20,15 +20,12 @@ import logging
 import os
 import time
 import math
-from typing import Dict, Any, Optional, List, Union, Tuple
+from typing import Dict, Any, Optional, List
 from datetime import datetime
 from dataclasses import dataclass
 import pymysql
 from pymysql import Connection
-from pymysql.cursors import Cursor
-from pymysql.connections import MySQLResult
 from dbutils.pooled_db import PooledDB
-from dbutils.persistent_db import PersistentDB
 
 from .config import DatabaseConfig
 from .constants import DEFAULT_CONFIG, STRING_CONSTANTS

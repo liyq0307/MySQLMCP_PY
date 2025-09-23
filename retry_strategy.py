@@ -21,7 +21,7 @@ from typing import Any, Callable, Dict, List, Optional, TypeVar, Generic
 from dataclasses import dataclass, field
 
 from typeUtils import ErrorCategory, ErrorSeverity, MySQLMCPError
-from logger import structured_logger
+from logger import logger
 
 T = TypeVar('T')
 
@@ -414,7 +414,7 @@ class SmartRetryStrategy:
         if context:
             log_data.update(context)
 
-        structured_logger.warn(f"Retry attempt: {log_message}", extra=log_data)
+        logger.warn(f"Retry attempt: {log_message}", extra=log_data)
 
 
 # 创建全局重试策略实例

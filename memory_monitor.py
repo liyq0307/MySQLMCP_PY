@@ -17,7 +17,6 @@ import psutil
 import gc
 import time
 import threading
-import weakref
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Callable
 
