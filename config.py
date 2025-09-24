@@ -18,7 +18,7 @@ from typing import List
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
-from .constants import DEFAULT_CONFIG, STRING_CONSTANTS
+from constants import DEFAULT_CONFIG, STRING_CONSTANTS
 
 # 加载环境变量配置
 load_dotenv()

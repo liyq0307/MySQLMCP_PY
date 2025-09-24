@@ -21,7 +21,7 @@ from enum import Enum
 
 from mysql_manager import MySQLManager
 from error_handler import MySQLMCPError, ErrorCategory, ErrorSeverity
-from logger import structured_logger
+from logger import logger
 
 
 class IndexType(Enum):
@@ -137,15 +137,21 @@ class SlowQueryAnalysisModule:
     def __init__(self, mysql_manager: MySQLManager, config: Optional[PerformanceAnalysisConfig] = None):
         """初始化慢查询分析模块"""
         self.mysql_manager = mysql_manager
+        # 创建默认配置
         self.config = PerformanceAnalysisConfig(
             longQueryTime=1,
             logQueriesNotUsingIndexes=True,
             minExaminedRowLimit=1000,
             maxLogFileSize=100,
             logSlowAdminStatements=True,
-            enablePerformanceSchema=True,
-            **(config.__dict__ if config else {})
+            enablePerformanceSchema=True
         )
+
+        # 如果提供了配置，更新默认配置
+        if config:
+            for key, value in config.__dict__.items():
+                if value is not None:
+                    setattr(self.config, key, value)
 
     async def enable_slow_query_log(self, config: Optional[SlowQueryConfig] = None) -> bool:
         """启用慢查询日志"""
@@ -199,13 +205,13 @@ class SlowQueryAnalysisModule:
             )
 
         self.config = PerformanceAnalysisConfig(**{**self.config.__dict__, **effective_config.__dict__})
-        structured_logger.warning("✅ 慢查询日志已成功启用")
+        logger.warn("✅ 慢查询日志已成功启用")
         return True
 
     async def disable_slow_query_log(self) -> bool:
         """禁用慢查询日志"""
         await self.mysql_manager.execute_query("SET GLOBAL slow_query_log = 'OFF'")
-        structured_logger.warning("⏹️ 慢查询日志已禁用")
+        logger.warn("⏹️ 慢查询日志已禁用")
         return True
 
     async def get_slow_query_log_config(self) -> Dict[str, Any]:
@@ -242,7 +248,7 @@ class SlowQueryAnalysisModule:
                 if result:
                     results.update(result[0])
             except Exception as error:
-                structured_logger.warning(f"获取状态信息失败 ({i}):", error=str(error))
+                logger.warn(f"获取状态信息失败 ({i}):", error=str(error))
 
         return results
 
@@ -1005,7 +1011,7 @@ class QueryProfilingModule:
                                 recommendations.append('查询使用临时表进行分组，建议优化GROUP BY')
 
         except Exception as error:
-            structured_logger.warning(f"分析JSON EXPLAIN结果时出错: {str(error)}")
+            logger.warn(f"分析JSON EXPLAIN结果时出错: {str(error)}")
 
         return recommendations
 
@@ -1074,7 +1080,7 @@ class PerformanceMonitoringModule:
                 interval_minutes
             )
 
-            structured_logger.warning(f"🔍 [性能监控] 开始监控，每 {interval_minutes} 分钟分析一次")
+            logger.warn(f"🔍 [性能监控] 开始监控，每 {interval_minutes} 分钟分析一次")
         except Exception as error:
             raise MySQLMCPError(
                 f"启动性能监控失败: {str(error)}",
@@ -1088,7 +1094,7 @@ class PerformanceMonitoringModule:
             self.monitoring_interval.cancel()
             self.monitoring_interval = None
         self.monitoring_active = False
-        structured_logger.warning("⏹️ [性能监控] 性能监控已停止")
+        logger.warn("⏹️ [性能监控] 性能监控已停止")
 
     def get_monitoring_status(self) -> Dict[str, Any]:
         """获取监控状态"""
@@ -1103,13 +1109,13 @@ class PerformanceMonitoringModule:
             analysis = await self.slow_query_analysis.analyze_slow_queries(20, '1 hour')
 
             if analysis.totalSlowQueries > 0:
-                structured_logger.warning(f"⚠️ [性能监控] 检测到 {analysis.totalSlowQueries} 个慢查询")
-                structured_logger.warning(f"📊 [性能监控] 最慢查询耗时: {analysis.slowestQuery.executionTime:.2f}s" if analysis.slowestQuery else "")
+                logger.warn(f"⚠️ [性能监控] 检测到 {analysis.totalSlowQueries} 个慢查询")
+                logger.warn(f"📊 [性能监控] 最慢查询耗时: {analysis.slowestQuery.executionTime:.2f}s" if analysis.slowestQuery else "")
 
                 if analysis.indexSuggestions:
-                    structured_logger.warning(f"💡 [性能监控] 发现 {len(analysis.indexSuggestions)} 个索引优化建议")
+                    logger.warn(f"💡 [性能监控] 发现 {len(analysis.indexSuggestions)} 个索引优化建议")
             else:
-                structured_logger.warning("✅ [性能监控] 查询性能正常")
+                logger.warn("✅ [性能监控] 查询性能正常")
 
             # 继续下一个监控周期
             if self.monitoring_active:
@@ -1119,7 +1125,7 @@ class PerformanceMonitoringModule:
                     interval_minutes
                 )
         except Exception as error:
-            structured_logger.error(f"❌ [性能监控] 监控过程发生错误: {str(error)}")
+            logger.error(f"❌ [性能监控] 监控过程发生错误: {str(error)}")
 
 
 class ReportingModule:
@@ -1234,7 +1240,7 @@ class ReportingModule:
             return f"{hit_rate:.1f}%"
         except Exception as error:
             # 查询缓存可能不可用或被禁用
-            structured_logger.warning(f"获取查询缓存命中率失败: {str(error)}")
+            logger.warn(f"获取查询缓存命中率失败: {str(error)}")
             return 'N/A'
 
     async def _get_innodb_buffer_pool_hit_rate(self) -> str:
@@ -1268,7 +1274,7 @@ class ReportingModule:
             return f"{max(0, hit_rate):.1f}%"
         except Exception as error:
             # InnoDB统计可能不可用
-            structured_logger.warning(f"获取InnoDB缓冲池命中率失败: {str(error)}")
+            logger.warn(f"获取InnoDB缓冲池命中率失败: {str(error)}")
             return 'N/A'
 
     def _generate_comprehensive_recommendations(
@@ -1345,7 +1351,7 @@ class PerformanceManager:
             for setting in settings:
                 await self.mysql_manager.execute_query(setting)
 
-            structured_logger.warning(f"✅ 慢查询日志已配置，阈值: {long_query_time}秒")
+            logger.warn(f"✅ 慢查询日志已配置，阈值: {long_query_time}秒")
         except Exception as error:
             raise MySQLMCPError(
                 f"配置慢查询日志失败: {str(error)}",
@@ -1382,7 +1388,7 @@ class PerformanceManager:
         """禁用慢查询日志"""
         try:
             await self.mysql_manager.execute_query('SET GLOBAL slow_query_log = "OFF"')
-            structured_logger.warning("⏹️ 慢查询日志已禁用")
+            logger.warn("⏹️ 慢查询日志已禁用")
         except Exception as error:
             raise MySQLMCPError(
                 f"禁用慢查询日志失败: {str(error)}",

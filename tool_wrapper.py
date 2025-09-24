@@ -11,13 +11,11 @@ MCP 工具包装器
 @license MIT
 """
 
-import logging
 from typing import Any, Callable, Dict, Optional, TypeVar
 from pydantic import BaseModel
 
-from .constants import STRING_CONSTANTS
-
-logger = logging.getLogger(__name__)
+from constants import STRING_CONSTANTS
+from logger import logger
 
 T = TypeVar('T')
 
@@ -47,7 +45,7 @@ def check_rate_limit(args: Dict, operation_type: str) -> bool:
     @return: 是否允许请求
     """
     try:
-        from .rate_limit import rate_limiter
+        from rate_limit import rate_limiter
 
         # 生成客户端标识符
         client_id = getattr(args, 'client_ip', None) or 'unknown'
@@ -57,7 +55,7 @@ def check_rate_limit(args: Dict, operation_type: str) -> bool:
         return rate_limiter.is_allowed(identifier)
 
     except Exception as e:
-        logger.warning(f"限流检查失败，使用默认策略: {e}")
+        logger.warn(f"限流检查失败，使用默认策略: {e}")
         # 如果限流检查失败，默认允许请求
         return True
 
@@ -70,7 +68,7 @@ def get_rate_limit_status(args: Dict, operation_type: str) -> Dict:
     @return: 限流状态信息
     """
     try:
-        from .rate_limit import rate_limiter
+        from rate_limit import rate_limiter
 
         client_id = getattr(args, 'client_ip', None) or 'unknown'
         identifier = f"{client_id}:{operation_type}"
@@ -87,7 +85,7 @@ def get_rate_limit_status(args: Dict, operation_type: str) -> Dict:
         }
 
     except Exception as e:
-        logger.warning(f"获取限流状态失败: {e}")
+        logger.warn(f"获取限流状态失败: {e}")
         return {
             "allowed": True,
             "remaining": 999,
@@ -124,7 +122,7 @@ def create_tool_handler(
             # 限流检查
             if enable_rate_limiting and not check_rate_limit(args, operation_type):
                 rate_status = get_rate_limit_status(args, operation_type)
-                from .typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+                from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
                 raise MySQLMCPError(
                     STRING_CONSTANTS["MSG_RATE_LIMIT_EXCEEDED"],
                     ErrorCategory.RATE_LIMIT_ERROR,
@@ -149,13 +147,14 @@ def create_tool_handler(
             # 性能监控错误
             if start_time is not None:
                 duration = time.time() - start_time
-                logger.warning(f"工具 {tool_name} 执行失败，耗时: {duration:.3f}秒")
+                logger.warn(f"工具 {tool_name} 执行失败，耗时: {duration:.3f}秒")
 
             # 错误处理
             final_error_message = error_message or f"工具 {tool_name} 执行失败"
             logger.error(f"{final_error_message}: {str(e)}")
 
             # 如果是MySQLMCPError，保持原样
+            from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
             if isinstance(e, MySQLMCPError):
                 raise
 

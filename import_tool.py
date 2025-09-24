@@ -23,7 +23,7 @@ import pandas as pd
 
 from mysql_manager import MySQLManager
 from error_handler import ErrorHandler
-from logger import structured_logger
+from logger import logger
 from typeUtils import (
     ImportOptions, ImportResult, ValidationResult, FieldMapping,
     DuplicateCheckConfig, DuplicateCacheItem,
@@ -877,7 +877,7 @@ class MySQLImportTool:
             self.current_candidate_keys = candidate_keys
 
         except Exception as error:
-            structured_logger.warn("Failed to initialize candidate keys", {
+            logger.warn("Failed to initialize candidate keys", {
                 "table_name": table_name,
                 "error": str(error)
             })
@@ -910,7 +910,7 @@ class MySQLImportTool:
         primary_key_fields = [f for f in field_mapping if f.required and f.target_field]
 
         if not primary_key_fields:
-            structured_logger.error("无法更新记录：未找到主键或必需字段", {
+            logger.error("无法更新记录：未找到主键或必需字段", {
                 "table_name": table_name
             })
             return 0
@@ -945,7 +945,7 @@ class MySQLImportTool:
                 updated_rows += 1
 
             except Exception as error:
-                structured_logger.warn("Failed to update duplicate row", {
+                logger.warn("Failed to update duplicate row", {
                     "table_name": table_name,
                     "error": str(error)
                 })
@@ -977,7 +977,7 @@ class MySQLImportTool:
         """清理重复检查缓存"""
         self.duplicate_cache.clear()
         self.current_candidate_keys = []
-        structured_logger.info("Duplicate cache cleared", {
+        logger.info("Duplicate cache cleared", {
             "cache_type": "duplicate-cache",
             "items_cleared": len(self.duplicate_cache)
         })

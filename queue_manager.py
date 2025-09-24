@@ -18,7 +18,7 @@ from typing import Any, Callable, Dict, List, Optional, Literal
 from dataclasses import dataclass, field
 
 from typeUtils import QueueTask, QueueStats, QueueConfig
-from logger import structured_logger
+from logger import logger
 
 
 @dataclass(order=True)
@@ -59,7 +59,7 @@ class QueueManager:
         self.is_running = True
         self.scheduler_task = asyncio.create_task(self._scheduler_loop())
 
-        structured_logger.info("Queue manager started", {
+        logger.info("Queue manager started", {
             "max_concurrent": self.config.max_concurrent,
             "max_queue_size": self.config.max_queue_size
         })
@@ -74,7 +74,7 @@ class QueueManager:
             except asyncio.CancelledError:
                 pass
 
-        structured_logger.info("Queue manager stopped")
+        logger.info("Queue manager stopped")
 
     def add_task(
         self,
@@ -108,7 +108,7 @@ class QueueManager:
 
         self.stats["total_tasks"] += 1
 
-        structured_logger.info("Task added to queue", {
+        logger.info("Task added to queue", {
             "task_id": task_id,
             "type": task_type,
             "priority": priority,
@@ -135,7 +135,7 @@ class QueueManager:
 
         self.stats["cancelled_tasks"] += 1
 
-        structured_logger.info("Task cancelled", {"task_id": task_id})
+        logger.info("Task cancelled", {"task_id": task_id})
         return True
 
     def get_task_status(self, task_id: str) -> Optional[QueueTask]:
@@ -210,7 +210,7 @@ class QueueManager:
                     asyncio.create_task(self._execute_task(task))
                     self.running_tasks += 1
 
-                    structured_logger.debug("Task started", {
+                    logger.debug("Task started", {
                         "task_id": task.id,
                         "running_tasks": self.running_tasks
                     })
@@ -218,7 +218,7 @@ class QueueManager:
                 await asyncio.sleep(0.1)  # 短暂延迟避免忙等待
 
             except Exception as error:
-                structured_logger.error("Scheduler loop error", {"error": str(error)})
+                logger.error("Scheduler loop error", {"error": str(error)})
                 await asyncio.sleep(1)
 
     async def _execute_task(self, task: QueueTask) -> None:
@@ -227,7 +227,7 @@ class QueueManager:
             task.status = "running"
             task.started_at = datetime.now()
 
-            structured_logger.info("Executing task", {
+            logger.info("Executing task", {
                 "task_id": task.id,
                 "type": task.type,
                 "priority": task.priority
@@ -254,7 +254,7 @@ class QueueManager:
 
             self.stats["completed_tasks"] += 1
 
-            structured_logger.info("Task completed", {
+            logger.info("Task completed", {
                 "task_id": task.id,
                 "duration": (task.completed_at - task.started_at).total_seconds() * 1000
             })
@@ -267,7 +267,7 @@ class QueueManager:
 
             self.stats["failed_tasks"] += 1
 
-            structured_logger.error("Task failed", {
+            logger.error("Task failed", {
                 "task_id": task.id,
                 "error": str(error)
             })
@@ -285,7 +285,7 @@ class QueueManager:
         await asyncio.sleep(delay)
         if task_id in self.tasks:
             del self.tasks[task_id]
-            structured_logger.debug("Task cleaned up", {"task_id": task_id})
+            logger.debug("Task cleaned up", {"task_id": task_id})
 
     def get_all_tasks(self, status_filter: Optional[str] = None) -> List[QueueTask]:
         """获取所有任务"""
@@ -307,7 +307,7 @@ class QueueManager:
 
         cleared_count = len(queued_tasks)
 
-        structured_logger.info("Queue cleared", {"cleared_count": cleared_count})
+        logger.info("Queue cleared", {"cleared_count": cleared_count})
 
         return cleared_count
 

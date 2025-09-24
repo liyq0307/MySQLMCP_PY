@@ -11,11 +11,11 @@ MySQL MCP 服务器 - 数据库操作服务
 @license MIT
 """
 
-from .mysql_manager import MySQLManager
-from .connection import ConnectionPool
-from .config import ConfigurationManager
-from .cache import CacheManager
-from .typeUtils import (
+from mysql_manager import MySQLManager
+from connection import ConnectionPool
+from config import ConfigurationManager
+from cache import CacheManager
+from typeUtils import (
     MySQLMCPError, ErrorSeverity, ErrorCategory, ValidationLevel,
     QueryResult, BackupOptions, ExportOptions, ImportOptions,
     # RBAC相关类型
@@ -30,29 +30,28 @@ from .typeUtils import (
     # 进度信息
     ProgressInfo, ImportStatistics
 )
-from .constants import STRING_CONSTANTS, DEFAULT_CONFIG
+from constants import STRING_CONSTANTS, DEFAULT_CONFIG
 
 __version__ = "1.0.0"
 __author__ = "liyq"
 __license__ = "MIT"
 
 # 导入核心模块
-from .mysql_manager import MySQLManager
-from .connection import ConnectionPool
-from .config import ConfigurationManager
-from .cache import CacheManager
-from .performance_manager import PerformanceManager
-from .memory_monitor import MemoryMonitor
-from .system_monitor import SystemMonitor
-from .memory_pressure_manager import memory_pressure_manager
-from .backup_tool import MySQLBackupTool
-from .import_tool import MySQLImportTool
-from .rbac import rbac_manager, RBACManager
-from .retry_strategy import smart_retry_strategy, SmartRetryStrategy
-from .security import SecurityValidator, SecurityAuditor, security_pattern_detector
-from .rate_limit import TokenBucketRateLimiter, AdaptiveRateLimiter
-from .queue_manager import queue_manager, QueueManager
-from .exporter_factory import exporter_factory, ExporterFactory, BaseExporter
+from mysql_manager import MySQLManager
+from connection import ConnectionPool
+from config import ConfigurationManager
+from cache import CacheManager
+from performance_manager import PerformanceManager
+from monitor import MemoryMonitor, SystemMonitor
+from memory_pressure_manager import memory_pressure_manager
+from backup_tool import MySQLBackupTool
+from import_tool import MySQLImportTool
+from rbac import rbac_manager, RBACManager
+from retry_strategy import smart_retry_strategy, SmartRetryStrategy
+from security import SecurityValidator, SecurityAuditor, security_pattern_detector
+from rate_limit import TokenBucketRateLimiter, AdaptiveRateLimiter
+from queue_manager import queue_manager, QueueManager
+from exporter import exporter_factory, ExporterFactory, BaseExporter
 
 __all__ = [
     # 核心模块

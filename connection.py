@@ -16,7 +16,6 @@ MySQL企业级连接池管理器 - 智能连接池与健康监控系统
 
 import asyncio
 import json
-import logging
 import os
 import time
 import math
@@ -27,10 +26,9 @@ import pymysql
 from pymysql import Connection
 from dbutils.pooled_db import PooledDB
 
-from .config import DatabaseConfig
-from .constants import DEFAULT_CONFIG, STRING_CONSTANTS
-
-logger = logging.getLogger(__name__)
+from config import DatabaseConfig
+from constants import DEFAULT_CONFIG, STRING_CONSTANTS
+from logger import logger
 
 
 @dataclass
@@ -162,6 +160,9 @@ class ConnectionPool:
 
     async def _create_pool(self) -> None:
         """创建连接池"""
+        # 首先测试连接是否可用
+        await self._test_connection()
+
         pool_config = {
             'host': self.config.host,
             'port': self.config.port,
@@ -171,7 +172,7 @@ class ConnectionPool:
             'charset': STRING_CONSTANTS["CHARSET"],
             'autocommit': True,
             'maxconnections': self.current_connection_limit,
-            'mincached': self.config.min_connections,
+            'mincached': 0,  # 避免在初始化时立即创建连接
             'maxcached': self.current_connection_limit,
             'maxshared': 0,
             'blocking': True,
@@ -186,6 +187,25 @@ class ConnectionPool:
             pool_config['ssl'] = {}
 
         self.pool = PooledDB(creator=pymysql, **pool_config)
+
+    async def _test_connection(self) -> None:
+        """测试MySQL连接是否可用"""
+        try:
+            connection = pymysql.connect(
+                host=self.config.host,
+                port=self.config.port,
+                user=self.config.user,
+                password=self.config.password,
+                database=self.config.database,
+                charset=STRING_CONSTANTS["CHARSET"],
+                connect_timeout=5  # 短超时用于测试
+            )
+            connection.ping()
+            connection.close()
+            logger.info(f"MySQL连接测试成功: {self.config.host}:{self.config.port}")
+        except Exception as e:
+            logger.error(f"MySQL连接测试失败: {e}")
+            raise ConnectionError(f"无法连接到MySQL服务器 {self.config.host}:{self.config.port}: {e}")
 
     async def _pre_create_connections(self) -> None:
         """预创建最小连接数"""
@@ -204,12 +224,12 @@ class ConnectionPool:
                     if connections_created >= 5:  # 每批5个连接短暂延迟
                         await asyncio.sleep(0.01)
                 except Exception as e:
-                    logger.warning(f"预创建连接失败: {e}")
+                    logger.warn(f"预创建连接失败: {e}")
                     break
 
             logger.info(f"连接池预热完成，预创建了 {connections_created} 个连接")
         except Exception as e:
-            logger.warning(f"连接池预热失败: {e}")
+            logger.warn(f"连接池预热失败: {e}")
 
     async def _start_monitoring_tasks(self) -> None:
         """启动所有监控任务"""
@@ -225,7 +245,7 @@ class ConnectionPool:
                 await self._perform_health_check()
                 self.stats.last_health_check = time.time()
             except Exception as e:
-                logger.warning(f"健康检查失败: {e}")
+                logger.warn(f"健康检查失败: {e}")
                 self.stats.health_check_failures += 1
 
             await asyncio.sleep(DEFAULT_CONFIG["HEALTH_CHECK_INTERVAL"])
@@ -377,7 +397,7 @@ class ConnectionPool:
 
                 if attempt < max_retries:
                     delay = base_delay * (2 ** attempt)  # 指数退避
-                    logger.warning(f"获取连接失败 (尝试 {attempt + 1}/{max_retries + 1})，{delay}秒后重试：{e}")
+                    logger.warn(f"获取连接失败 (尝试 {attempt + 1}/{max_retries + 1})，{delay}秒后重试：{e}")
                     await asyncio.sleep(delay)
                 else:
                     logger.error(f"获取连接失败，已重试 {max_retries + 1} 次：{e}")
@@ -390,7 +410,7 @@ class ConnectionPool:
                 await self._detect_leaked_connections()
                 await asyncio.sleep(DEFAULT_CONFIG["LEAK_DETECTION_INTERVAL"])
             except Exception as e:
-                logger.warning(f"连接泄漏检测出错: {e}")
+                logger.warn(f"连接泄漏检测出错: {e}")
                 await asyncio.sleep(30)  # 出错时等待30秒
 
     async def _detect_leaked_connections(self) -> None:
@@ -406,7 +426,7 @@ class ConnectionPool:
 
         if suspected_leaks:
             self.stats.connection_leaks_detected += len(suspected_leaks)
-            logger.warning(f"检测到 {len(suspected_leaks)} 个可能的连接泄漏")
+            logger.warn(f"检测到 {len(suspected_leaks)} 个可能的连接泄漏")
 
             for conn_id, tracked_conn, duration in suspected_leaks:
                 logger.error(f"{STRING_CONSTANTS['MSG_CONNECTION_LEAK_DETECTED']} [ID: {conn_id}]", extra={
@@ -420,7 +440,7 @@ class ConnectionPool:
                     if hasattr(tracked_conn.connection, 'close'):
                         tracked_conn.connection.close()
                     self.active_connections.pop(conn_id, None)
-                    logger.warning(f"连接 {conn_id} 已强制修复")
+                    logger.warn(f"连接 {conn_id} 已强制修复")
                 except Exception as e:
                     logger.error(f"修复连接 {conn_id} 失败: {e}")
 
@@ -431,7 +451,7 @@ class ConnectionPool:
                 await asyncio.sleep(DEFAULT_CONFIG["POOL_ADJUSTMENT_INTERVAL"])
                 await self._adjust_pool_size()
             except Exception as e:
-                logger.warning(f"连接池调整出错: {e}")
+                logger.warn(f"连接池调整出错: {e}")
 
     async def _adjust_pool_size(self) -> None:
         """动态调整连接池大小"""
@@ -462,7 +482,7 @@ class ConnectionPool:
                 self.stats.dynamic_adjustments += 1
 
         except Exception as e:
-            logger.warning(f"连接池大小调整失败: {e}")
+            logger.warn(f"连接池大小调整失败: {e}")
 
     async def _recreate_pool(self, new_connection_limit: int) -> None:
         """重建连接池"""
@@ -526,7 +546,7 @@ class ConnectionPool:
                 if i % 5 == 0:  # 每5个连接短暂延迟
                     await asyncio.sleep(0.01)
         except Exception as e:
-            logger.warning(f"连接池预热失败: {e}")
+            logger.warn(f"连接池预热失败: {e}")
 
     async def _graceful_shutdown_pool(self, pool: PooledDB) -> None:
         """优雅关闭连接池"""
@@ -535,7 +555,7 @@ class ConnectionPool:
             # PooledDB 没有直接的异步关闭方法，使用线程池执行
             await asyncio.get_event_loop().run_in_executor(None, lambda: None)  # 占位
         except Exception as e:
-            logger.warning(f"关闭旧连接池时出现警告: {e}")
+            logger.warn(f"关闭旧连接池时出现警告: {e}")
 
     async def _stats_saver_loop(self) -> None:
         """统计数据保存循环"""
@@ -544,7 +564,7 @@ class ConnectionPool:
                 await asyncio.sleep(300)  # 每5分钟保存一次
                 await self._save_stats_to_file()
             except Exception as e:
-                logger.warning(f"保存统计数据失败: {e}")
+                logger.warn(f"保存统计数据失败: {e}")
 
     async def _save_stats_to_file(self) -> None:
         """保存统计数据到文件"""
@@ -570,7 +590,7 @@ class ConnectionPool:
             logger.debug(f"统计数据已保存到 {self.stats_file_path}")
 
         except Exception as e:
-            logger.warning(f"保存统计数据失败: {e}")
+            logger.warn(f"保存统计数据失败: {e}")
 
     async def _load_stats_from_file(self) -> None:
         """从文件加载统计数据"""
@@ -597,7 +617,7 @@ class ConnectionPool:
             logger.debug(f"已从 {self.stats_file_path} 恢复统计数据")
 
         except Exception as e:
-            logger.warning(f"加载统计数据失败: {e}")
+            logger.warn(f"加载统计数据失败: {e}")
 
     async def _trigger_recovery(self) -> None:
         """触发高级恢复机制"""
@@ -691,7 +711,7 @@ class ConnectionPool:
                 if hasattr(tracked_conn.connection, 'close'):
                     tracked_conn.connection.close()
             except Exception as e:
-                logger.warning(f"清理连接 {conn_id} 时出错: {e}")
+                logger.warn(f"清理连接 {conn_id} 时出错: {e}")
             finally:
                 self.active_connections.pop(conn_id, None)
 

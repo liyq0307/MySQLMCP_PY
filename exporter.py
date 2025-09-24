@@ -11,20 +11,17 @@
 @license MIT
 """
 
-import csv
 import json
 import os
 from abc import ABC, abstractmethod
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Type, Union
+from typing import Any, Dict, List, Optional, Type
 import pandas as pd
 
 from mysql_manager import MySQLManager
-from memory_monitor import MemoryMonitor
-from typeUtils import ExportOptions, ExportResult, ErrorCategory
-from error_handler import ErrorHandler
-from logger import structured_logger
+from monitor import MemoryMonitor
+from typeUtils import ExportOptions, ExportResult
+from logger import logger
 
 
 class BaseExporter(ABC):
@@ -207,7 +204,7 @@ class ExporterFactory:
             if len(self._cache) < 10:
                 self._cache[exporter_type] = exporter
 
-            structured_logger.debug("Exporter created", {
+            logger.debug("Exporter created", {
                 "type": exporter_type,
                 "cached": len(self._cache)
             })
@@ -215,7 +212,7 @@ class ExporterFactory:
             return exporter
 
         except Exception as error:
-            structured_logger.error("Failed to create exporter", {
+            logger.error("Failed to create exporter", {
                 "type": exporter_type,
                 "error": str(error)
             })
@@ -228,7 +225,7 @@ class ExporterFactory:
     def clear_cache(self) -> None:
         """清空缓存"""
         self._cache.clear()
-        structured_logger.info("Exporter cache cleared")
+        logger.info("Exporter cache cleared")
 
 
 # 创建全局导出器工厂实例

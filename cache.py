@@ -14,17 +14,16 @@
 
 import asyncio
 import json
-import logging
 import re
 import hashlib
 from typing import Dict, Any, Optional, List, Generic, TypeVar, Iterator, Union
 from datetime import datetime, timedelta
+from logger import logger
 import threading
 import weakref
 from enum import Enum
 import psutil
 
-logger = logging.getLogger(__name__)
 
 T = TypeVar('T')
 
@@ -215,7 +214,7 @@ class MemoryPressureManager:
                 try:
                     observer.on_pressure_change(pressure)
                 except Exception as e:
-                    logger.warning(f"内存压力观察者通知失败: {e}")
+                    logger.warn(f"内存压力观察者通知失败: {e}")
 
     def get_current_pressure(self) -> float:
         """获取当前内存压力"""
@@ -635,12 +634,12 @@ class SmartCache(Generic[T]):
                 if value is not None:
                     await self.put(key, value)
         except Exception as e:
-            logger.warning(f"预取数据时发生错误: {key} - {e}")
+            logger.warn(f"预取数据时发生错误: {key} - {e}")
 
     async def warmup(self, data: Dict[str, T]) -> None:
         """批量预热缓存"""
         if self.warmup_status["is_warming"]:
-            logger.warning("缓存预热已在进行中")
+            logger.warn("缓存预热已在进行中")
             return
 
         self.warmup_status["is_warming"] = True
@@ -961,7 +960,7 @@ class CacheManager:
 
             await asyncio.gather(*tasks)
         except Exception as e:
-            logger.warning(f"预加载表 {table_name} 的缓存信息失败: {e}")
+            logger.warn(f"预加载表 {table_name} 的缓存信息失败: {e}")
 
     async def _preload_single(self, key: str, region: str, loader: callable) -> None:
         """预加载单个缓存项"""
@@ -969,7 +968,7 @@ class CacheManager:
             value = await loader()
             await self.set(region, key, value)
         except Exception as e:
-            logger.warning(f"预加载缓存项 {key} 失败: {e}")
+            logger.warn(f"预加载缓存项 {key} 失败: {e}")
 
     def set_weak_map_protection(self, region: str, enabled: bool) -> None:
         """启用或禁用指定区域的WeakMap防护"""
@@ -1103,12 +1102,12 @@ class CacheManager:
     async def invalidate_query_cache_by_table(self, table_name: str) -> None:
         """按表名失效查询缓存"""
         if not table_name:
-            logger.warning("Invalid table name provided for query cache invalidation")
+            logger.warn("Invalid table name provided for query cache invalidation")
             return
 
         query_cache = self.caches.get(CacheRegion.QUERY_RESULT)
         if not query_cache:
-            logger.warning("Query result cache instance not found")
+            logger.warn("Query result cache instance not found")
             return
 
         normalized_table_name = table_name.lower()
@@ -1147,12 +1146,12 @@ class CacheManager:
     async def invalidate_query_cache_by_table(self, table_name: str) -> None:
         """按表名失效查询缓存"""
         if not table_name:
-            logger.warning("Invalid table name provided for query cache invalidation")
+            logger.warn("Invalid table name provided for query cache invalidation")
             return
 
         query_cache = self.caches.get(CacheRegion.QUERY_RESULT)
         if not query_cache:
-            logger.warning("Query result cache instance not found")
+            logger.warn("Query result cache instance not found")
             return
 
         normalized_table_name = table_name.lower()

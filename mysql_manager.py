@@ -16,12 +16,12 @@ MySQL 高级管理器 - 企业级数据库操作核心
 import time
 from typing import Any, Dict, List, Optional
 
-from .connection import ConnectionPool
-from .config import ConfigurationManager
-from .cache import CacheManager, CacheRegion
-from .constants import STRING_CONSTANTS
-from .typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity, ValidationLevel
-from .logger import logger
+from connection import ConnectionPool
+from config import ConfigurationManager
+from cache import CacheManager, CacheRegion
+from constants import STRING_CONSTANTS
+from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity, ValidationLevel
+from logger import logger
 
 
 class MySQLManager:

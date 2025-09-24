@@ -13,8 +13,8 @@ MySQL企业级日志记录系统 - 结构化日志与安全审计中心
 @license MIT
 """
 
-from .loggers.structured_logger import StructuredLogger, LogConfig, LogLevel, LogOutput
-from .loggers.security_logger import SecurityLogger, SecurityEventType, SecurityLogEntry
+from loggers.structured_logger import StructuredLogger, LogConfig, LogLevel, LogOutput
+from loggers.security_logger import SecurityLogger, SecurityEventType, SecurityLogEntry
 
 # 全局结构化日志记录器实例
 logger = StructuredLogger.get_instance(LogConfig(

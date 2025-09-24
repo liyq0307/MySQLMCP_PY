@@ -13,7 +13,7 @@ MySQL MCP错误处理与智能分析系统
 """
 
 from typing import Any, Dict, Optional
-from .typeUtils import ErrorCategory, ErrorSeverity, ErrorContext, MySQLMCPError
+from typeUtils import ErrorCategory, ErrorSeverity, ErrorContext, MySQLMCPError
 
 
 class ErrorHandler:

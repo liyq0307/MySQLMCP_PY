@@ -29,8 +29,8 @@ from openpyxl.styles import Font, PatternFill
 from mysql_manager import MySQLManager
 from cache import CacheRegion
 from error_handler import ErrorHandler
-from logger import structured_logger
-from memory_monitor import MemoryMonitor
+from logger import logger
+from monitor import MemoryMonitor
 from typeUtils import (
     BackupOptions, BackupResult, ExportOptions, ExportResult,
     ReportConfig, IncrementalBackupOptions, IncrementalBackupResult,
@@ -73,19 +73,29 @@ class MySQLBackupTool:
         # 设置内存管理
         self._setup_memory_management()
 
-        # 启动任务调度器
-        asyncio.create_task(self._start_task_scheduler())
+        # 启动任务调度器（延迟到事件循环中启动）
+        self._scheduler_task = None
 
-        # 优化并发数
-        self._optimize_max_concurrency()
+        # 优化并发数（延迟到事件循环中执行）
+        self._optimize_task = None
+
+    def start_scheduler(self) -> None:
+        """启动任务调度器"""
+        if self._scheduler_task is None:
+            self._scheduler_task = asyncio.create_task(self._start_task_scheduler())
+
+    def start_optimization(self) -> None:
+        """启动并发优化"""
+        if self._optimize_task is None:
+            self._optimize_task = asyncio.create_task(self._optimize_max_concurrency())
 
     def _setup_memory_management(self) -> None:
         """设置内存管理"""
-        self.memory_monitor.enable_memory_monitoring()
+        self.memory_monitor.start_monitoring()
 
         # 监听内存压力并采取行动
         async def handle_memory_pressure(pressure: float) -> None:
-            structured_logger.info("Memory pressure detected", {
+            logger.info("Memory pressure detected", {
                 "pressure": pressure,
                 "action": "cleanup"
             })
@@ -99,13 +109,13 @@ class MySQLBackupTool:
 
                 # 如果压力仍然很高，暂停新任务
                 if pressure > 0.95:
-                    structured_logger.warning("Critical memory pressure", {
+                    logger.warning("Critical memory pressure", {
                         "pressure": pressure,
                         "message": "Pausing new tasks due to high memory usage"
                     })
 
         # 注册内存压力回调
-        self.memory_monitor.memory_pressure_callbacks.append(handle_memory_pressure)
+        self.memory_monitor.add_alert_callback(handle_memory_pressure)
 
     async def _optimize_max_concurrency(self) -> None:
         """优化最大并发数基于系统资源"""
@@ -120,7 +130,7 @@ class MySQLBackupTool:
         else:
             self.max_concurrent_tasks = 3
 
-        structured_logger.info("Concurrency optimized", {
+        logger.info("Concurrency optimized", {
             "max_concurrent_tasks": self.max_concurrent_tasks,
             "available_memory_mb": available_memory / 1024 / 1024
         })
@@ -167,7 +177,7 @@ class MySQLBackupTool:
                 "record_count": total_record_count
             }
         except Exception as error:
-            structured_logger.warn("Failed to get optimized table statistics", {
+            logger.warn("Failed to get optimized table statistics", {
                 "error": str(error)
             })
             return {"table_count": 0, "record_count": 0}
@@ -200,7 +210,7 @@ class MySQLBackupTool:
             await self.cache_manager.set(CacheRegion.QUERY_RESULT, cache_key, count)
             return count
         except Exception as error:
-            structured_logger.warn(f"Failed to get count for table {table_name}", {
+            logger.warn(f"Failed to get count for table {table_name}", {
                 "error": str(error)
             })
             return 0
@@ -315,7 +325,7 @@ class MySQLBackupTool:
 
             safe_error = ErrorHandler.safe_error(error, 'create_backup')
 
-            structured_logger.error("Backup failed", {
+            logger.error("Backup failed", {
                 "error": safe_error.message,
                 "duration": int((time.time() - start_time) * 1000),
                 "memory_usage": self.memory_monitor.get_current_usage().model_dump()
@@ -521,7 +531,7 @@ class MySQLBackupTool:
 
             return None
         except Exception as error:
-            structured_logger.warn("Failed to get last backup time", {
+            logger.warn("Failed to get last backup time", {
                 "error": str(error),
                 "tracking_table": tracking_table
             })
@@ -575,7 +585,7 @@ class MySQLBackupTool:
             }
 
         except Exception as error:
-            structured_logger.warn("Failed to get changed tables", {
+            logger.warn("Failed to get changed tables", {
                 "error": str(error),
                 "since_time": since_time.isoformat() if since_time else None
             })
@@ -623,7 +633,7 @@ class MySQLBackupTool:
 
             return None
         except Exception as error:
-            structured_logger.warn(f"Failed to check changes for table {table}", {
+            logger.warn(f"Failed to check changes for table {table}", {
                 "error": str(error)
             })
             return None
@@ -639,7 +649,7 @@ class MySQLBackupTool:
             """, [backup_time, backup_type, backup_path, file_size])
 
         except Exception as error:
-            structured_logger.warn("Failed to update backup tracking", {
+            logger.warn("Failed to update backup tracking", {
                 "error": str(error),
                 "tracking_table": tracking_table
             })
@@ -1119,7 +1129,7 @@ class MySQLBackupTool:
 
         self._scheduler_running = True
 
-        structured_logger.info("Task scheduler started", {
+        logger.info("Task scheduler started", {
             "max_concurrent_tasks": self.max_concurrent_tasks,
             "adaptive_scheduling": True
         })
@@ -1132,7 +1142,7 @@ class MySQLBackupTool:
                 interval = 0.5 if queued_tasks > 5 else 1.0
                 await asyncio.sleep(interval)
             except Exception as error:
-                structured_logger.warn("Task queue processing error", {
+                logger.warn("Task queue processing error", {
                     "error": str(error)
                 })
 
@@ -1165,7 +1175,7 @@ class MySQLBackupTool:
             task.started_at = datetime.now()
             self.running_tasks += 1
 
-            structured_logger.info("Task started", {
+            logger.info("Task started", {
                 "task_id": task.id,
                 "type": task.type,
                 "running_tasks": self.running_tasks
@@ -1178,7 +1188,7 @@ class MySQLBackupTool:
             task.completed_at = datetime.now()
             self.running_tasks -= 1
 
-            structured_logger.info("Task completed", {
+            logger.info("Task completed", {
                 "task_id": task.id,
                 "type": task.type,
                 "duration": (task.completed_at - task.started_at).total_seconds() * 1000 if task.started_at and task.completed_at else 0,
@@ -1191,7 +1201,7 @@ class MySQLBackupTool:
             task.error = str(error)
             self.running_tasks -= 1
 
-            structured_logger.error("Task failed", {
+            logger.error("Task failed", {
                 "task_id": task.id,
                 "type": task.type,
                 "error": str(error),
@@ -1211,7 +1221,7 @@ class MySQLBackupTool:
 
         for task_id in to_remove:
             del self.task_queue[task_id]
-            structured_logger.debug("Task cleaned up", {"task_id": task_id})
+            logger.debug("Task cleaned up", {"task_id": task_id})
 
     async def _cleanup_completed_trackers(self) -> None:
         """清理已完成的进度跟踪器"""

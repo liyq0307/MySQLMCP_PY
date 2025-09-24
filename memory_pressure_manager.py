@@ -17,7 +17,7 @@ from typing import Any, Optional
 import psutil
 import gc
 
-from logger import structured_logger
+from logger import logger
 
 
 class MemoryPressureObserver:
@@ -74,7 +74,7 @@ class MemoryPressureManager:
             try:
                 observer.on_pressure_change(self._current_pressure)
             except Exception as error:
-                structured_logger.warn("Failed to notify new observer", {
+                logger.warn("Failed to notify new observer", {
                     "error": str(error)
                 })
 
@@ -120,7 +120,7 @@ class MemoryPressureManager:
             except asyncio.CancelledError:
                 break
             except Exception as error:
-                structured_logger.warn("Memory pressure monitoring error", {
+                logger.warn("Memory pressure monitoring error", {
                     "error": str(error)
                 })
 
@@ -145,7 +145,7 @@ class MemoryPressureManager:
             combined_pressure = max(heap_pressure, system_pressure)
             pressure = max(0.2, min(1.0, combined_pressure * 1.2))
 
-            structured_logger.debug("Calculated memory pressure", {
+            logger.debug("Calculated memory pressure", {
                 "heap_pressure": heap_pressure,
                 "system_pressure": system_pressure,
                 "combined_pressure": combined_pressure,
@@ -157,7 +157,7 @@ class MemoryPressureManager:
             return pressure
 
         except Exception as error:
-            structured_logger.warn("Failed to calculate memory pressure", {
+            logger.warn("Failed to calculate memory pressure", {
                 "error": str(error)
             })
             return 0.5  # 默认中等压力
@@ -173,7 +173,7 @@ class MemoryPressureManager:
                 old_pressure = self._current_pressure
                 self._current_pressure = new_pressure
 
-                structured_logger.info("Memory pressure changed", {
+                logger.info("Memory pressure changed", {
                     "old_pressure": old_pressure,
                     "new_pressure": new_pressure,
                     "change": pressure_change
@@ -182,7 +182,7 @@ class MemoryPressureManager:
                 await self._notify_observers(new_pressure)
 
         except Exception as error:
-            structured_logger.warn("Failed to update memory pressure", {
+            logger.warn("Failed to update memory pressure", {
                 "error": str(error)
             })
 
@@ -195,7 +195,7 @@ class MemoryPressureManager:
                 else:
                     observer.on_pressure_change(pressure)
             except Exception as error:
-                structured_logger.warn("Memory pressure observer failed", {
+                logger.warn("Memory pressure observer failed", {
                     "observer": str(type(observer).__name__),
                     "error": str(error)
                 })
@@ -239,7 +239,7 @@ class MemoryPressureManager:
                 "observer_count": len(self._observers)
             }
         except Exception as error:
-            structured_logger.warn("Failed to get memory stats", {
+            logger.warn("Failed to get memory stats", {
                 "error": str(error)
             })
             return {
@@ -252,7 +252,7 @@ class MemoryPressureManager:
         """如果需要则触发垃圾回收"""
         if self.should_trigger_gc():
             collected = gc.collect()
-            structured_logger.info("GC triggered due to high memory pressure", {
+            logger.info("GC triggered due to high memory pressure", {
                 "objects_collected": collected,
                 "pressure": self._current_pressure
             })

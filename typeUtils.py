@@ -509,7 +509,7 @@ class ErrorRecoveryResult(BaseModel):
     recovery_applied: Optional[str] = None
     attempts_used: int
     error: Optional[str] = None
-    final_error: Optional[Exception] = None
+    final_error: Optional[str] = None
 
 
 class LargeFileOptions(BaseModel):
@@ -754,7 +754,7 @@ class RetryResult(BaseModel):
     success: bool
     attempts_used: int
     total_delay: int
-    final_error: Optional[Exception] = None
+    final_error: Optional[str] = None
     result: Optional[Any] = None
 
 

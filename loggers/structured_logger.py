@@ -396,7 +396,7 @@ class StructuredLogger:
 
     def _mask_sensitive_fields(self, metadata: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """掩码敏感字段"""
-        if not metadata:
+        if not metadata or not isinstance(metadata, dict):
             return metadata
 
         masked = metadata.copy()

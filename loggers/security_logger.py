@@ -18,7 +18,10 @@ from typing import Any, Dict, List, Optional
 from enum import Enum
 from uuid import uuid4
 
-from ..typeUtils import ErrorSeverity
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from typeUtils import ErrorSeverity
 
 
 class SecurityEventType(str, Enum):

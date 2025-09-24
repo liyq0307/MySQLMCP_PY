@@ -12,8 +12,9 @@ MySQL MCP服务器主文件
 """
 
 import json
-import logging
 import os
+import signal
+import sys
 import time
 from typing import Any, Dict, List, Optional
 from datetime import datetime
@@ -21,23 +22,18 @@ from pydantic import BaseModel
 
 from fastmcp import FastMCP
 
-from .mysql_manager import MySQLManager
-from .tool_wrapper import create_mcp_tool, ToolDefinition
-from .constants import STRING_CONSTANTS
-from .error_handler import ErrorHandler
-from .logger import logger
-from .system_monitor import system_monitor
-from .memory_monitor import memory_monitor
-from .performance_manager import PerformanceManager
-from .backup_tool import MySQLBackupTool
-from .import_tool import MySQLImportTool
-from .rate_limit import RateLimiterManager, create_rate_limiter_from_config
-from .config import config_manager
-from .typeUtils import ErrorCategory, ErrorSeverity, MySQLMCPError, RateLimitConfig
-
-# 配置日志
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from mysql_manager import MySQLManager
+from tool_wrapper import create_mcp_tool, ToolDefinition
+from constants import STRING_CONSTANTS
+from error_handler import ErrorHandler
+from logger import logger
+from monitor import system_monitor, memory_monitor
+from performance_manager import PerformanceManager
+from backup_tool import MySQLBackupTool
+from import_tool import MySQLImportTool
+from rate_limit import RateLimiterManager
+from config import config_manager
+from typeUtils import ErrorCategory, ErrorSeverity, MySQLMCPError, RateLimitConfig
 
 # 创建MySQL管理器实例
 mysql_manager = MySQLManager()
@@ -72,15 +68,38 @@ rate_limiter = RateLimiterManager(rate_limiter_config)
 # =============================================================================
 
 class QueryParams(BaseModel):
+    """MySQL查询参数模型
+
+    用于传递SQL查询语句和参数绑定的数据结构。
+    支持参数化查询以防止SQL注入攻击。
+
+    @param query: SQL查询语句字符串
+    @param params: 可选的参数列表，用于参数化查询
+    """
     query: str
     params: Optional[List[Any]] = None
 
 
 class TableNameParams(BaseModel):
+    """表名参数模型
+
+    简单的参数模型，只包含表名，用于需要指定表的操作。
+
+    @param table_name: 目标表的名称
+    """
     table_name: str
 
 
 class SelectDataParams(BaseModel):
+    """数据查询参数模型
+
+    用于从表中查询数据的参数模型，支持列选择、WHERE条件和行数限制。
+
+    @param table_name: 要查询的表名
+    @param columns: 可选的列名列表，如果未指定则查询所有列
+    @param where_clause: 可选的WHERE条件子句
+    @param limit: 可选的行数限制
+    """
     table_name: str
     columns: Optional[List[str]] = None
     where_clause: Optional[str] = None
@@ -88,41 +107,103 @@ class SelectDataParams(BaseModel):
 
 
 class InsertDataParams(BaseModel):
+    """数据插入参数模型
+
+    用于向表中插入新数据的参数模型。
+
+    @param table_name: 要插入数据的表名
+    @param data: 要插入的数据字典，键为列名，值为对应的数据
+    """
     table_name: str
     data: Dict[str, Any]
 
 
 class UpdateDataParams(BaseModel):
+    """数据更新参数模型
+
+    用于更新表中现有数据的参数模型，根据WHERE条件更新指定数据。
+
+    @param table_name: 要更新数据的表名
+    @param data: 要更新的数据字典，键为列名，值为新数据
+    @param where_clause: WHERE条件子句，指定要更新的行
+    """
     table_name: str
     data: Dict[str, Any]
     where_clause: str
 
 
 class DeleteDataParams(BaseModel):
+    """数据删除参数模型
+
+    用于从表中删除数据的参数模型，根据WHERE条件删除符合条件的数据。
+
+    @param table_name: 要删除数据的表名
+    @param where_clause: WHERE条件子句，指定要删除的行
+    """
     table_name: str
     where_clause: str
 
 
 class CreateTableParams(BaseModel):
+    """创建表参数模型
+
+    用于创建新表的参数模型，包含表名和列定义信息。
+
+    @param table_name: 要创建的表名
+    @param columns: 列定义列表，每个列包含名称、类型、约束等信息
+    """
     table_name: str
     columns: List[Dict[str, Any]]
 
 
 class DropTableParams(BaseModel):
+    """删除表参数模型
+
+    用于删除表的参数模型，支持可选的IF EXISTS子句。
+
+    @param table_name: 要删除的表名
+    @param if_exists: 可选，是否使用IF EXISTS子句，避免表不存在时报错
+    """
     table_name: str
     if_exists: Optional[bool] = False
 
 
 class AlterTableParams(BaseModel):
+    """修改表结构参数模型
+
+    用于修改表结构的参数模型，支持添加、修改、删除列和索引等操作。
+
+    @param table_name: 要修改的表名
+    @param alterations: 修改操作列表，每个操作包含类型和具体参数
+    """
     table_name: str
     alterations: List[Dict[str, Any]]
 
 
 class BatchExecuteParams(BaseModel):
+    """批量执行参数模型
+
+    用于批量执行多个SQL查询的参数模型，在单个事务中执行以确保原子性。
+
+    @param queries: 查询列表，每个查询包含SQL语句和可选的参数
+    """
     queries: List[Dict[str, Any]]
 
 
 class BackupParams(BaseModel):
+    """数据库备份参数模型
+
+    用于配置数据库备份操作的参数模型，支持完整的备份选项。
+
+    @param output_dir: 可选的输出目录路径
+    @param compress: 可选，是否压缩备份文件，默认True
+    @param include_data: 可选，是否包含表数据，默认True
+    @param include_structure: 可选，是否包含表结构，默认True
+    @param tables: 可选，要备份的特定表列表
+    @param file_prefix: 可选，备份文件名前缀，默认"mysql_backup"
+    @param max_file_size: 可选，最大文件大小(MB)，默认100
+    @param backup_type: 可选，备份类型，默认"full"
+    """
     output_dir: Optional[str] = None
     compress: Optional[bool] = True
     include_data: Optional[bool] = True
@@ -134,6 +215,19 @@ class BackupParams(BaseModel):
 
 
 class ExportDataParams(BaseModel):
+    """数据导出参数模型
+
+    用于配置数据导出操作的参数模型，支持多种格式和选项。
+
+    @param query: 要执行的导出查询SQL语句
+    @param params: 可选，查询参数列表
+    @param output_dir: 可选，输出目录路径
+    @param format: 可选，导出格式，默认"excel"
+    @param sheet_name: 可选，Excel工作表名称，默认"Data"
+    @param include_headers: 可选，是否包含列标题，默认True
+    @param max_rows: 可选，最大导出行数，默认100000
+    @param file_name: 可选，自定义文件名
+    """
     query: str
     params: Optional[List[Any]] = None
     output_dir: Optional[str] = None
@@ -145,6 +239,17 @@ class ExportDataParams(BaseModel):
 
 
 class GenerateReportParams(BaseModel):
+    """报表生成参数模型
+
+    用于配置数据报表生成的参数模型，支持多查询和Excel输出。
+
+    @param title: 报表标题
+    @param description: 可选，报表描述
+    @param queries: 查询列表，每个查询包含名称和SQL语句
+    @param output_dir: 可选，输出目录路径
+    @param file_name: 可选，自定义文件名
+    @param include_headers: 可选，是否包含列标题，默认True
+    """
     title: str
     description: Optional[str] = None
     queries: List[Dict[str, Any]]
@@ -154,6 +259,25 @@ class GenerateReportParams(BaseModel):
 
 
 class ImportDataParams(BaseModel):
+    """数据导入参数模型
+
+    用于配置数据导入操作的参数模型，支持多种文件格式和导入选项。
+
+    @param table_name: 目标表名
+    @param file_path: 要导入的文件路径
+    @param format: 文件格式，支持csv、json、excel、sql等
+    @param has_headers: 可选，CSV/Excel文件是否有标题行，默认True
+    @param field_mapping: 可选，字段映射字典
+    @param batch_size: 可选，批处理大小，默认1000
+    @param skip_duplicates: 可选，是否跳过重复行，默认False
+    @param conflict_strategy: 可选，冲突处理策略，默认"error"
+    @param use_transaction: 可选，是否使用事务，默认True
+    @param validate_data: 可选，是否验证数据，默认True
+    @param encoding: 可选，文件编码，默认"utf8"
+    @param sheet_name: 可选，Excel工作表名称
+    @param delimiter: 可选，CSV分隔符，默认","
+    @param quote: 可选，CSV引号字符，默认'"'
+    """
     table_name: str
     file_path: str
     format: str
@@ -171,11 +295,30 @@ class ImportDataParams(BaseModel):
 
 
 class AnalyzeErrorParams(BaseModel):
+    """错误分析参数模型
+
+    用于传递错误信息进行分析的参数模型。
+
+    @param error_message: 要分析的错误消息
+    @param operation: 可选，发生错误的上下文操作
+    """
     error_message: str
     operation: Optional[str] = None
 
 
 class ManageIndexesParams(BaseModel):
+    """索引管理参数模型
+
+    用于配置索引管理操作的参数模型，支持创建、删除、分析索引等操作。
+
+    @param action: 操作类型，如"create"、"drop"、"analyze"、"optimize"、"list"
+    @param table_name: 可选，目标表名
+    @param index_name: 可选，索引名称
+    @param index_type: 可选，索引类型，默认"INDEX"
+    @param columns: 可选，索引包含的列名列表
+    @param if_exists: 可选，删除时是否检查索引存在，默认False
+    @param invisible: 可选，是否创建不可见索引，默认False
+    """
     action: str
     table_name: Optional[str] = None
     index_name: Optional[str] = None
@@ -186,6 +329,19 @@ class ManageIndexesParams(BaseModel):
 
 
 class ManageUsersParams(BaseModel):
+    """用户管理参数模型
+
+    用于配置MySQL用户管理操作的参数模型，支持创建、删除用户和权限管理。
+
+    @param action: 操作类型，如"create"、"delete"、"grant"、"revoke"、"list"、"show_grants"
+    @param username: 可选，用户名
+    @param password: 可选，密码（创建用户时必需）
+    @param host: 可选，主机地址，默认"%"
+    @param privileges: 可选，权限列表
+    @param database: 可选，目标数据库名
+    @param table: 可选，目标表名
+    @param if_exists: 可选，删除时是否检查用户存在，默认False
+    """
     action: str
     username: Optional[str] = None
     password: Optional[str] = None
@@ -197,6 +353,16 @@ class ManageUsersParams(BaseModel):
 
 
 class ProgressTrackerParams(BaseModel):
+    """进度跟踪参数模型
+
+    用于配置操作进度跟踪的参数模型，支持列出、获取和取消操作。
+
+    @param action: 操作类型，如"list"、"get"、"cancel"、"summary"
+    @param tracker_id: 可选，跟踪器ID
+    @param operation_type: 可选，操作类型过滤，默认"all"
+    @param include_completed: 可选，是否包含已完成的操作，默认False
+    @param detail_level: 可选，详情级别，默认"basic"
+    """
     action: str
     tracker_id: Optional[str] = None
     operation_type: Optional[str] = "all"
@@ -205,6 +371,16 @@ class ProgressTrackerParams(BaseModel):
 
 
 class OptimizeMemoryParams(BaseModel):
+    """内存优化参数模型
+
+    用于配置内存优化操作的参数模型，支持状态检查、清理和配置管理。
+
+    @param action: 操作类型，如"status"、"cleanup"、"optimize"、"configure"、"report"、"gc"
+    @param force_gc: 可选，是否强制垃圾回收，默认True
+    @param enable_monitoring: 可选，是否启用监控
+    @param max_concurrency: 可选，最大并发数
+    @param include_history: 可选，是否包含历史记录，默认False
+    """
     action: str
     force_gc: Optional[bool] = True
     enable_monitoring: Optional[bool] = None
@@ -213,6 +389,16 @@ class OptimizeMemoryParams(BaseModel):
 
 
 class ManageQueueParams(BaseModel):
+    """队列管理参数模型
+
+    用于配置任务队列管理操作的参数模型，支持暂停、恢复、设置并发数等。
+
+    @param action: 操作类型，如"status"、"pause"、"resume"、"clear"、"set_concurrency"、"cancel"、"diagnostics"、"get_task"
+    @param task_id: 可选，任务ID
+    @param max_concurrency: 可选，最大并发数
+    @param show_details: 可选，是否显示详情，默认False
+    @param filter_type: 可选，过滤类型，默认"all"
+    """
     action: str
     task_id: Optional[str] = None
     max_concurrency: Optional[int] = None
@@ -221,6 +407,20 @@ class ManageQueueParams(BaseModel):
 
 
 class PerformanceOptimizeParams(BaseModel):
+    """性能优化参数模型
+
+    用于配置性能优化和监控操作的参数模型，支持慢查询分析和索引建议。
+
+    @param action: 操作类型，如"enable_slow_query_log"、"status_slow_query_log"等
+    @param query: 可选，要分析的SQL查询
+    @param params: 可选，查询参数
+    @param limit: 可选，结果限制数量，默认50
+    @param include_details: 可选，是否包含详细信息，默认True
+    @param time_range: 可选，时间范围，默认"1 day"
+    @param long_query_time: 可选，慢查询阈值（秒）
+    @param log_queries_not_using_indexes: 可选，是否记录未使用索引的查询
+    @param monitoring_interval_minutes: 可选，监控间隔（分钟），默认60
+    """
     action: str
     query: Optional[str] = None
     params: Optional[List[Any]] = None
@@ -274,7 +474,7 @@ def check_rate_limit(args: Dict, operation_type: str) -> bool:
         return rate_limiter.is_allowed(identifier)
 
     except Exception as e:
-        logger.warning(f"限流检查失败，使用默认策略: {e}")
+        logger.warn(f"限流检查失败，使用默认策略: {e}")
         # 如果限流检查失败，默认允许请求
         return True
 
@@ -302,7 +502,7 @@ def get_rate_limit_status(args: Dict, operation_type: str) -> Dict:
         }
 
     except Exception as e:
-        logger.warning(f"获取限流状态失败: {e}")
+        logger.warn(f"获取限流状态失败: {e}")
         return {
             "allowed": True,
             "remaining": 999,
@@ -661,7 +861,7 @@ async def mysql_batch_execute(args: BatchExecuteParams) -> str:
         # 检查批量操作的速率限制（批量操作更严格）
         if not check_rate_limit(args, "batch_execute"):
             rate_status = get_rate_limit_status(args, "batch_execute")
-            from .typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+            from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
             raise MySQLMCPError(
                 STRING_CONSTANTS["MSG_RATE_LIMIT_EXCEEDED"],
                 ErrorCategory.RATE_LIMIT_ERROR,
@@ -784,7 +984,7 @@ async def mysql_alter_table(args: AlterTableParams) -> str:
     @return: JSON格式的修改结果，包含操作统计、性能指标和执行详情
     @throws: MySQLMCPError 当表名无效、修改操作有误或执行失败时
     """
-    from .typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+    from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
 
     start_time = time.time()
     mysql_manager.validate_table_name(args.table_name)
@@ -1219,7 +1419,7 @@ async def mysql_import_data(args: ImportDataParams) -> str:
     """数据导入"""
     try:
         import pandas as pd
-        from .typeUtils import ImportResult, ErrorCategory, ErrorSeverity, MySQLMCPError
+        from typeUtils import ImportResult, ErrorCategory, ErrorSeverity, MySQLMCPError
 
         start_time = time.time()
 
@@ -1467,12 +1667,18 @@ async def _process_import_batch(
 
         except Exception as e:
             failed += 1
-            logger.warning(f"导入行失败: {e}")
+            logger.warn(f"导入行失败: {e}")
 
     return imported, failed
 
 
 class VerifyBackupParams(BaseModel):
+    """备份验证参数模型
+
+    用于验证备份文件完整性的参数模型。
+
+    @param backup_file_path: 要验证的备份文件路径
+    """
     backup_file_path: str
 
 
@@ -1504,6 +1710,15 @@ class OptimizeMemoryParams(BaseModel):
 
 
 class RateLimitManageParams(BaseModel):
+    """速率限制管理参数模型
+
+    用于配置速率限制管理操作的参数模型，支持状态查看、重置和配置更新。
+
+    @param action: 操作类型，如"status"、"reset"、"update_config"、"get_stats"、"demo_algorithms"
+    @param operation_type: 可选，操作类型
+    @param identifier: 可选，标识符
+    @param new_config: 可选，新配置字典
+    """
     action: str
     operation_type: Optional[str] = None
     identifier: Optional[str] = None
@@ -1512,6 +1727,20 @@ class RateLimitManageParams(BaseModel):
 
 # 性能优化相关参数类
 class PerformanceOptimizeParams(BaseModel):
+    """性能优化参数模型
+
+    用于配置性能优化和监控操作的参数模型，支持慢查询分析和索引建议。
+
+    @param action: 操作类型，如"enable_slow_query_log"、"status_slow_query_log"等
+    @param query: 可选，要分析的SQL查询
+    @param params: 可选，查询参数
+    @param limit: 可选，结果限制数量，默认50
+    @param include_details: 可选，是否包含详细信息，默认True
+    @param time_range: 可选，时间范围，默认"1 day"
+    @param long_query_time: 可选，慢查询阈值（秒）
+    @param log_queries_not_using_indexes: 可选，是否记录未使用索引的查询
+    @param monitoring_interval_minutes: 可选，监控间隔（分钟），默认60
+    """
     action: str
     query: Optional[str] = None
     params: Optional[List[Any]] = None
@@ -1525,6 +1754,23 @@ class PerformanceOptimizeParams(BaseModel):
 
 # 备份工具相关参数类
 class IncrementalBackupParams(BaseModel):
+    """增量备份参数模型
+
+    用于配置增量备份操作的参数模型，支持基于时间戳、binlog等多种增量模式。
+
+    @param output_dir: 可选，输出目录路径
+    @param compress: 可选，是否压缩，默认True
+    @param include_data: 可选，是否包含数据，默认True
+    @param include_structure: 可选，是否包含结构，默认False
+    @param tables: 可选，要备份的表列表
+    @param file_prefix: 可选，文件名前缀，默认"mysql_incremental"
+    @param max_file_size: 可选，最大文件大小(MB)，默认100
+    @param incremental_mode: 可选，增量模式，默认"timestamp"
+    @param tracking_table: 可选，跟踪表名，默认"__backup_tracking"
+    @param base_backup_path: 可选，基础备份路径
+    @param last_backup_time: 可选，最后备份时间
+    @param binlog_position: 可选，binlog位置
+    """
     output_dir: Optional[str] = None
     compress: Optional[bool] = True
     include_data: Optional[bool] = True
@@ -2717,7 +2963,7 @@ async def mysql_export_data(args: ExportDataParams) -> str:
         # 检查导出操作的速率限制
         if not check_rate_limit(args, "export"):
             rate_status = get_rate_limit_status(args, "export")
-            from .typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+            from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
             raise MySQLMCPError(
                 STRING_CONSTANTS["MSG_RATE_LIMIT_EXCEEDED"],
                 ErrorCategory.RATE_LIMIT_ERROR,
@@ -2730,7 +2976,7 @@ async def mysql_export_data(args: ExportDataParams) -> str:
 
         import pandas as pd
         from pathlib import Path
-        from .typeUtils import ExportResult, ErrorCategory, ErrorSeverity, MySQLMCPError
+        from typeUtils import ExportResult, ErrorCategory, ErrorSeverity, MySQLMCPError
 
         start_time = time.time()
 
@@ -2799,7 +3045,7 @@ async def mysql_export_data(args: ExportDataParams) -> str:
             # 限制行数
             if len(result) > max_rows:
                 result = result[:max_rows]
-                logger.warning(f"结果集超过最大行数限制 {max_rows}，已截断")
+                logger.warn(f"结果集超过最大行数限制 {max_rows}，已截断")
 
             # 转换为DataFrame
             df = pd.DataFrame(result)
@@ -2934,319 +3180,406 @@ async def mysql_manage_indexes(args: ManageIndexesParams) -> str:
 
 
 # =============================================================================
+# 信号处理器
+# =============================================================================
+
+async def graceful_shutdown(signum, frame):
+    """优雅关闭处理器"""
+    logger.info(f"收到信号 {signum}，开始优雅关闭", "graceful_shutdown")
+
+    try:
+        # 停止系统监控
+        system_monitor.stop_monitoring()
+        logger.info("系统监控已停止")
+
+        # 停止内存监控
+        memory_monitor.stop_monitoring()
+        logger.info("内存监控已停止")
+
+        # 关闭MySQL管理器
+        await mysql_manager.close()
+        logger.info("MySQL管理器已关闭")
+
+        logger.info("服务已优雅关闭", "graceful_shutdown")
+    except Exception as e:
+        logger.error(f"优雅关闭过程中发生错误: {e}", "graceful_shutdown")
+
+    # 退出进程
+    sys.exit(0)
+
+
+def setup_signal_handlers():
+    """设置信号处理器"""
+    def signal_handler(signum, frame):
+        """信号处理器包装函数"""
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(graceful_shutdown(signum, frame))
+        except RuntimeError:
+            # 没有运行的事件循环，直接运行同步关闭
+            asyncio.run(graceful_shutdown(signum, frame))
+
+    try:
+        # 注册信号处理器
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        logger.info("信号处理器已设置", "signal_setup")
+    except (OSError, ValueError) as e:
+        logger.warn(f"设置信号处理器失败: {e}", "signal_setup")
+
+
+# =============================================================================
 # 工具注册配置
 # =============================================================================
 
 def register_tools():
     """注册所有MCP工具"""
 
+    # 创建工具定义列表
+    tool_definitions = []
+
     # 基础查询工具
-    tools_config = [
-        # 基础查询工具
-        ToolDefinition(
-            name="mysql_query",
-            description="Execute MySQL queries (SELECT, SHOW, DESCRIBE, etc.)",
-            parameters=QueryParams,
-            handler=mysql_query,
-            operation_type="query"
-        ),
-        ToolDefinition(
-            name="mysql_show_tables",
-            description="Show all tables in the current database",
-            parameters=BaseModel,
-            handler=mysql_show_tables,
-            operation_type="metadata"
-        ),
-        ToolDefinition(
-            name="mysql_describe_table",
-            description="Describe the structure of a specified table",
-            parameters=TableNameParams,
-            handler=mysql_describe_table,
-            operation_type="metadata"
-        ),
+    tool_definitions.append(ToolDefinition(
+        name="mysql_query",
+        description="Execute MySQL queries (SELECT, SHOW, DESCRIBE, etc.)",
+        parameters={"query": "str", "params": "Optional[List[Any]]"},
+        handler=mysql_query,
+        error_message="执行MySQL查询失败",
+        operation_type="query"
+    ))
 
-        # CRUD操作工具
-        ToolDefinition(
-            name="mysql_select_data",
-            description="Select data from a table with optional conditions and limits",
-            parameters=SelectDataParams,
-            handler=mysql_select_data,
-            operation_type="select"
-        ),
-        ToolDefinition(
-            name="mysql_insert_data",
-            description="Insert new data into a table",
-            parameters=InsertDataParams,
-            handler=mysql_insert_data,
-            operation_type="insert"
-        ),
-        ToolDefinition(
-            name="mysql_update_data",
-            description="Update existing data in a table based on specified conditions",
-            parameters=UpdateDataParams,
-            handler=mysql_update_data,
-            operation_type="update"
-        ),
-        ToolDefinition(
-            name="mysql_delete_data",
-            description="Delete data from a table based on specified conditions",
-            parameters=DeleteDataParams,
-            handler=mysql_delete_data,
-            operation_type="delete"
-        ),
+    tool_definitions.append(ToolDefinition(
+        name="mysql_show_tables",
+        description="Show all tables in the current database",
+        parameters={},
+        handler=mysql_show_tables,
+        error_message="显示表列表失败",
+        operation_type="query"
+    ))
 
-        # 架构和元数据工具
-        ToolDefinition(
-            name="mysql_get_schema",
-            description="Get database schema information including tables, columns, and constraints",
-            parameters=TableNameParams,
-            handler=mysql_get_schema,
-            operation_type="metadata"
-        ),
-        ToolDefinition(
-            name="mysql_get_foreign_keys",
-            description="Get foreign key constraint information for a specific table or all tables in the database",
-            parameters=TableNameParams,
-            handler=mysql_get_foreign_keys,
-            operation_type="metadata"
-        ),
+    tool_definitions.append(ToolDefinition(
+        name="mysql_describe_table",
+        description="Describe table structure and schema",
+        parameters={"table_name": "str"},
+        handler=mysql_describe_table,
+        error_message="描述表结构失败",
+        operation_type="query"
+    ))
 
-        # DDL工具
-        ToolDefinition(
-            name="mysql_create_table",
-            description="Create a new table with specified columns and constraints",
-            parameters=CreateTableParams,
-            handler=mysql_create_table,
-            operation_type="ddl"
-        ),
-        ToolDefinition(
-            name="mysql_drop_table",
-            description="Drop (delete) a table from the database",
-            parameters=DropTableParams,
-            handler=mysql_drop_table,
-            operation_type="ddl"
-        ),
-        ToolDefinition(
-            name="mysql_alter_table",
-            description="Modify table structure by adding, modifying, or dropping columns and constraints",
-            parameters=AlterTableParams,
-            handler=mysql_alter_table,
-            operation_type="ddl"
-        ),
+    tool_definitions.append(ToolDefinition(
+        name="mysql_get_schema",
+        description="Get database schema information",
+        parameters={"table_name": "Optional[str]"},
+        handler=mysql_get_schema,
+        error_message="获取数据库架构失败",
+        operation_type="query"
+    ))
 
-        # 批量操作工具
-        ToolDefinition(
-            name="mysql_batch_execute",
-            description="Execute multiple SQL operations in a single transaction for atomicity",
-            parameters=BatchExecuteParams,
-            handler=mysql_batch_execute,
-            operation_type="batch"
-        ),
+    tool_definitions.append(ToolDefinition(
+        name="mysql_get_foreign_keys",
+        description="Get foreign key relationships",
+        parameters={"table_name": "Optional[str]"},
+        handler=mysql_get_foreign_keys,
+        error_message="获取外键关系失败",
+        operation_type="query"
+    ))
 
-        # 系统管理工具
-        ToolDefinition(
-            name="mysql_system_status",
-            description="Comprehensive system status check including connection, export, queue, and resource monitoring",
-            parameters=BaseModel,
-            handler=mysql_system_status,
-            operation_type="system"
-        ),
-        ToolDefinition(
-            name="mysql_analyze_error",
-            description="Analyze MySQL errors and provide diagnostic information, recovery suggestions, and prevention tips",
-            parameters=AnalyzeErrorParams,
-            handler=mysql_analyze_error,
-            operation_type="system"
-        ),
-        ToolDefinition(
-            name="mysql_manage_indexes",
-            description="Manage MySQL indexes: create, drop, analyze, and optimize indexes",
-            parameters=ManageIndexesParams,
-            handler=mysql_manage_indexes,
-            operation_type="management"
-        ),
-        ToolDefinition(
-            name="mysql_manage_users",
-            description="Manage MySQL users: create/delete users, grant/revoke privileges",
-            parameters=ManageUsersParams,
-            handler=mysql_manage_users,
-            operation_type="management"
-        ),
+    # 数据操作工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_select_data",
+        description="Select data from table with optional conditions",
+        parameters={"table_name": "str", "columns": "Optional[List[str]]", "where_clause": "Optional[str]", "limit": "Optional[int]"},
+        handler=mysql_select_data,
+        error_message="查询数据失败",
+        operation_type="data_operation"
+    ))
 
-        # 数据导入导出工具
-        ToolDefinition(
-            name="mysql_export_data",
-            description="Export query results to Excel, CSV, or JSON files",
-            parameters=ExportDataParams,
-            handler=mysql_export_data,
-            operation_type="export"
-        ),
-        ToolDefinition(
-            name="mysql_import_data",
-            description="Import data from various file formats (CSV, JSON, Excel, SQL) with advanced validation, mapping, and error handling",
-            parameters=ImportDataParams,
-            handler=mysql_import_data,
-            operation_type="import"
-        ),
+    tool_definitions.append(ToolDefinition(
+        name="mysql_insert_data",
+        description="Insert data into table",
+        parameters={"table_name": "str", "data": "Dict[str, Any]"},
+        handler=mysql_insert_data,
+        error_message="插入数据失败",
+        operation_type="data_operation"
+    ))
 
-        # 备份和恢复工具
-        ToolDefinition(
-            name="mysql_backup",
-            description="Create database backup with optional compression, table selection, and structure/data control",
-            parameters=BackupParams,
-            handler=mysql_backup,
-            operation_type="backup"
-        ),
-        ToolDefinition(
-            name="mysql_generate_report",
-            description="Generate comprehensive data report with multiple queries in Excel format",
-            parameters=GenerateReportParams,
-            handler=mysql_generate_report,
-            operation_type="backup"
-        ),
-        ToolDefinition(
-            name="mysql_verify_backup",
-            description="Verify integrity and validity of MySQL backup files",
-            parameters=VerifyBackupParams,
-            handler=mysql_verify_backup,
-            operation_type="backup"
-        ),
+    tool_definitions.append(ToolDefinition(
+        name="mysql_update_data",
+        description="Update data in table with conditions",
+        parameters={"table_name": "str", "data": "Dict[str, Any]", "where_clause": "str"},
+        handler=mysql_update_data,
+        error_message="更新数据失败",
+        operation_type="data_operation"
+    ))
 
-        # 系统监控工具
-        ToolDefinition(
-            name="mysql_progress_tracker",
-            description="Track progress of asynchronous operations",
-            parameters=ProgressTrackerParams,
-            handler=mysql_progress_tracker,
-            operation_type="system"
-        ),
-        ToolDefinition(
-            name="mysql_manage_queue",
-            description="Manage task queues for asynchronous operations",
-            parameters=ManageQueueParams,
-            handler=mysql_manage_queue,
-            operation_type="system"
-        ),
-        ToolDefinition(
-            name="mysql_optimize_memory",
-            description="Optimize memory usage and garbage collection",
-            parameters=OptimizeMemoryParams,
-            handler=mysql_optimize_memory,
-            operation_type="system"
-        ),
-        ToolDefinition(
-            name="mysql_performance_optimize",
-            description="MySQL performance optimization and slow query management",
-            parameters=PerformanceOptimizeParams,
-            handler=mysql_performance_optimize,
-            operation_type="system"
-        ),
-        ToolDefinition(
-            name="mysql_manage_rate_limit",
-            description="Manage rate limiting: check status, reset counters, update configuration, and test algorithms",
-            parameters=RateLimitManageParams,
-            handler=mysql_manage_rate_limit,
-            operation_type="system"
-        ),
-        ToolDefinition(
-            name="mysql_replication_status",
-            description="MySQL replication monitoring and diagnostics",
-            parameters=BaseModel,
-            handler=mysql_replication_status,
-            operation_type="system"
-        ),
+    tool_definitions.append(ToolDefinition(
+        name="mysql_delete_data",
+        description="Delete data from table with conditions",
+        parameters={"table_name": "str", "where_clause": "str"},
+        handler=mysql_delete_data,
+        error_message="删除数据失败",
+        operation_type="data_operation"
+    ))
 
-        # 高级备份工具
-        ToolDefinition(
-            name="mysql_backup_full",
-            description="Create full database backup with compression and table selection",
-            parameters=BackupParams,
-            handler=mysql_backup_full,
-            operation_type="backup"
-        ),
-        ToolDefinition(
-            name="mysql_backup_incremental",
-            description="Create incremental backup based on timestamp or binlog position",
-            parameters=IncrementalBackupParams,
-            handler=mysql_backup_incremental,
-            operation_type="backup"
-        ),
-        ToolDefinition(
-            name="mysql_export_data_advanced",
-            description="Advanced data export to Excel, CSV, or JSON with progress tracking",
-            parameters=ExportDataParams,
-            handler=mysql_export_data_advanced,
-            operation_type="export"
-        ),
-        ToolDefinition(
-            name="mysql_generate_report_advanced",
-            description="Generate comprehensive Excel reports with multiple queries",
-            parameters=GenerateReportParams,
-            handler=mysql_generate_report_advanced,
-            operation_type="backup"
-        ),
-        ToolDefinition(
-            name="mysql_verify_backup_advanced",
-            description="Verify backup file integrity and validity with detailed analysis",
-            parameters=VerifyBackupParams,
-            handler=mysql_verify_backup_advanced,
-            operation_type="backup"
-        ),
+    # 表结构管理工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_create_table",
+        description="Create a new table with column definitions",
+        parameters={"table_name": "str", "columns": "List[Dict[str, Any]]"},
+        handler=mysql_create_table,
+        error_message="创建表失败",
+        operation_type="schema_operation"
+    ))
 
-        # 高级导入工具
-        ToolDefinition(
-            name="mysql_import_from_csv",
-            description="Import data from CSV files with validation and duplicate checking",
-            parameters=ImportDataParams,
-            handler=mysql_import_from_csv,
-            operation_type="import"
-        ),
-        ToolDefinition(
-            name="mysql_import_from_json",
-            description="Import data from JSON files with nested object flattening",
-            parameters=ImportDataParams,
-            handler=mysql_import_from_json,
-            operation_type="import"
-        ),
-        ToolDefinition(
-            name="mysql_import_from_excel",
-            description="Import data from Excel files with multi-sheet support",
-            parameters=ImportDataParams,
-            handler=mysql_import_from_excel,
-            operation_type="import"
-        ),
-        ToolDefinition(
-            name="mysql_import_from_sql",
-            description="Execute SQL scripts for data import with transaction support",
-            parameters=ImportDataParams,
-            handler=mysql_import_from_sql,
-            operation_type="import"
-        ),
-        ToolDefinition(
-            name="mysql_import_data_advanced",
-            description="Universal data import supporting multiple formats with advanced features",
-            parameters=ImportDataParams,
-            handler=mysql_import_data_advanced,
-            operation_type="import"
-        ),
-        ToolDefinition(
-            name="mysql_validate_import",
-            description="Validate import data structure and compatibility before actual import",
-            parameters=ImportDataParams,
-            handler=mysql_validate_import,
-            operation_type="import"
-        ),
-    ]
+    tool_definitions.append(ToolDefinition(
+        name="mysql_drop_table",
+        description="Drop/delete a table",
+        parameters={"table_name": "str", "if_exists": "Optional[bool]"},
+        handler=mysql_drop_table,
+        error_message="删除表失败",
+        operation_type="schema_operation"
+    ))
 
-    # 批量注册工具
-    for tool_def in tools_config:
-        mcp.add_tool(create_mcp_tool(tool_def))
+    tool_definitions.append(ToolDefinition(
+        name="mysql_alter_table",
+        description="Alter table structure (add/modify/drop columns, indexes)",
+        parameters={"table_name": "str", "alterations": "List[Dict[str, Any]]"},
+        handler=mysql_alter_table,
+        error_message="修改表结构失败",
+        operation_type="schema_operation"
+    ))
+
+    # 批量操作工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_batch_execute",
+        description="Execute multiple queries in batch",
+        parameters={"queries": "List[Dict[str, Any]]"},
+        handler=mysql_batch_execute,
+        error_message="批量执行失败",
+        operation_type="batch_operation"
+    ))
+
+    # 备份和导出工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_backup",
+        description="Create full database backup",
+        parameters={
+            "output_dir": "Optional[str]", "compress": "Optional[bool]", "include_data": "Optional[bool]",
+            "include_structure": "Optional[bool]", "tables": "Optional[List[str]]",
+            "file_prefix": "Optional[str]", "max_file_size": "Optional[int]",
+            "backup_type": "Optional[str]"
+        },
+        handler=mysql_backup,
+        error_message="创建备份失败",
+        operation_type="backup"
+    ))
+
+    tool_definitions.append(ToolDefinition(
+        name="mysql_backup_incremental",
+        description="Create incremental backup",
+        parameters={
+            "output_dir": "Optional[str]", "compress": "Optional[bool]", "include_data": "Optional[bool]",
+            "include_structure": "Optional[bool]", "tables": "Optional[List[str]]",
+            "file_prefix": "Optional[str]", "max_file_size": "Optional[int]",
+            "incremental_mode": "Optional[str]", "tracking_table": "Optional[str]",
+            "base_backup_path": "Optional[str]", "last_backup_time": "Optional[str]",
+            "binlog_position": "Optional[str]"
+        },
+        handler=mysql_backup_incremental,
+        error_message="创建增量备份失败",
+        operation_type="backup"
+    ))
+
+    tool_definitions.append(ToolDefinition(
+        name="mysql_export_data",
+        description="Export data to various formats (Excel, CSV, JSON)",
+        parameters={
+            "query": "str", "params": "Optional[List[Any]]", "output_dir": "Optional[str]",
+            "format": "Optional[str]", "sheet_name": "Optional[str]",
+            "include_headers": "Optional[bool]", "max_rows": "Optional[int]",
+            "file_name": "Optional[str]"
+        },
+        handler=mysql_export_data,
+        error_message="导出数据失败",
+        operation_type="export"
+    ))
+
+    tool_definitions.append(ToolDefinition(
+        name="mysql_generate_report",
+        description="Generate advanced data reports",
+        parameters={
+            "title": "str", "description": "Optional[str]", "queries": "Optional[List[Dict[str, Any]]]",
+            "output_dir": "Optional[str]", "file_name": "Optional[str]", "include_headers": "Optional[bool]"
+        },
+        handler=mysql_generate_report,
+        error_message="生成报表失败",
+        operation_type="report"
+    ))
+
+    tool_definitions.append(ToolDefinition(
+        name="mysql_verify_backup",
+        description="Verify backup file integrity",
+        parameters={"backup_file_path": "str"},
+        handler=mysql_verify_backup,
+        error_message="验证备份失败",
+        operation_type="backup"
+    ))
+
+    # 数据导入工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_import_data",
+        description="Import data from various file formats",
+        parameters={
+            "table_name": "str", "file_path": "str", "format": "str",
+            "has_headers": "Optional[bool]", "field_mapping": "Optional[Dict[str, str]]",
+            "batch_size": "Optional[int]", "skip_duplicates": "Optional[bool]",
+            "conflict_strategy": "Optional[str]", "use_transaction": "Optional[bool]",
+            "validate_data": "Optional[bool]", "encoding": "Optional[str]",
+            "sheet_name": "Optional[str]", "delimiter": "Optional[str]", "quote": "Optional[str]"
+        },
+        handler=mysql_import_data,
+        error_message="导入数据失败",
+        operation_type="import"
+    ))
+
+    # 用户管理工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_manage_users",
+        description="Manage MySQL users (create, delete, grant, revoke permissions)",
+        parameters={
+            "action": "str", "username": "Optional[str]", "password": "Optional[str]",
+            "host": "Optional[str]", "privileges": "Optional[List[str]]",
+            "database": "Optional[str]", "table": "Optional[str]", "if_exists": "Optional[bool]"
+        },
+        handler=mysql_manage_users,
+        error_message="用户管理失败",
+        operation_type="user_management"
+    ))
+
+    # 索引管理工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_manage_indexes",
+        description="Manage database indexes (list, analyze, optimize)",
+        parameters={
+            "action": "str", "table_name": "Optional[str]", "index_name": "Optional[str]",
+            "index_type": "Optional[str]", "columns": "Optional[List[str]]",
+            "if_exists": "Optional[bool]", "invisible": "Optional[bool]"
+        },
+        handler=mysql_manage_indexes,
+        error_message="索引管理失败",
+        operation_type="index_management"
+    ))
+
+    # 系统监控和优化工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_system_status",
+        description="Get comprehensive system status",
+        parameters={},
+        handler=mysql_system_status,
+        error_message="获取系统状态失败",
+        operation_type="monitoring"
+    ))
+
+    tool_definitions.append(ToolDefinition(
+        name="mysql_analyze_error",
+        description="Analyze MySQL errors and provide recommendations",
+        parameters={"error_message": "str", "operation": "Optional[str]"},
+        handler=mysql_analyze_error,
+        error_message="错误分析失败",
+        operation_type="monitoring"
+    ))
+
+    tool_definitions.append(ToolDefinition(
+        name="mysql_performance_optimize",
+        description="Performance optimization and monitoring",
+        parameters={
+            "action": "str", "query": "Optional[str]", "params": "Optional[List[Any]]",
+            "limit": "Optional[int]", "include_details": "Optional[bool]",
+            "time_range": "Optional[str]", "long_query_time": "Optional[int]",
+            "log_queries_not_using_indexes": "Optional[bool]", "monitoring_interval_minutes": "Optional[int]"
+        },
+        handler=mysql_performance_optimize,
+        error_message="性能优化失败",
+        operation_type="optimization"
+    ))
+
+    # 内存和队列管理工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_optimize_memory",
+        description="Manage memory optimization and monitoring",
+        parameters={
+            "action": "str", "force_gc": "Optional[bool]", "enable_monitoring": "Optional[bool]",
+            "max_concurrency": "Optional[int]", "include_history": "Optional[bool]"
+        },
+        handler=mysql_optimize_memory,
+        error_message="内存优化失败",
+        operation_type="optimization"
+    ))
+
+    tool_definitions.append(ToolDefinition(
+        name="mysql_manage_queue",
+        description="Manage task queue operations",
+        parameters={
+            "action": "str", "task_id": "Optional[str]", "max_concurrency": "Optional[int]",
+            "show_details": "Optional[bool]", "filter_type": "Optional[str]"
+        },
+        handler=mysql_manage_queue,
+        error_message="队列管理失败",
+        operation_type="queue_management"
+    ))
+
+    # 限流管理工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_manage_rate_limit",
+        description="Manage rate limiting configuration and status",
+        parameters={
+            "action": "str", "operation_type": "Optional[str]", "identifier": "Optional[str]",
+            "new_config": "Optional[Dict[str, Any]]"
+        },
+        handler=mysql_manage_rate_limit,
+        error_message="限流管理失败",
+        operation_type="rate_limiting"
+    ))
+
+    # 复制监控工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_replication_status",
+        description="Monitor MySQL replication status",
+        parameters={"action": "Optional[str]"},
+        handler=mysql_replication_status,
+        error_message="复制状态监控失败",
+        operation_type="monitoring"
+    ))
+
+    # 进度跟踪工具
+    tool_definitions.append(ToolDefinition(
+        name="mysql_progress_tracker",
+        description="Track operation progress",
+        parameters={
+            "action": "str", "tracker_id": "Optional[str]", "operation_type": "Optional[str]",
+            "include_completed": "Optional[bool]", "detail_level": "Optional[str]"
+        },
+        handler=mysql_progress_tracker,
+        error_message="进度跟踪失败",
+        operation_type="monitoring"
+    ))
+
+    # 使用create_mcp_tool注册所有工具
+    for tool_def in tool_definitions:
+        tool_config = create_mcp_tool(tool_def)
+        mcp.tool(
+            name=tool_config["name"],
+            description=tool_config["description"]
+        )(tool_config["execute"])
 
 
 async def start_server():
     """启动服务器"""
     try:
         await mysql_manager.initialize()
+
+        # 注册所有工具
+        register_tools()
 
         # 启动系统监控
         system_monitor.start_monitoring()
@@ -3260,17 +3593,22 @@ async def start_server():
             "session_id": mysql_manager.session_id
         })
 
-        await mcp.start()
+        await mcp.run_async()
     except Exception as e:
-        logger.error("MySQL MCP服务器启动失败", "server_startup", {
+        logger.error("MySQL MCP服务器启动失败", "server_startup", e, {
             "error": str(e),
             "server_name": STRING_CONSTANTS["SERVER_NAME"],
             "version": STRING_CONSTANTS["SERVER_VERSION"]
-        }, e)
+        })
         await mysql_manager.close()
         raise
 
 
 if __name__ == "__main__":
     import asyncio
+
+    # 设置信号处理器
+    setup_signal_handlers()
+
+    # 启动服务器
     asyncio.run(start_server())
