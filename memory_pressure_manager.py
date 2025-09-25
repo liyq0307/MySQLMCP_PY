@@ -8,256 +8,193 @@
 @author liyq
 @version 1.0.0
 @since 1.0.0
-@updated 2025-09-23
 @license MIT
 """
 
-import asyncio
-from typing import Any, Optional
-import psutil
-import gc
-
+import threading
+from typing import List, Protocol, Optional
+from common_utils import MemoryUtils
 from logger import logger
 
 
-class MemoryPressureObserver:
+class MemoryPressureObserver(Protocol):
     """内存压力观察者接口"""
 
     def on_pressure_change(self, pressure: float) -> None:
-        """当内存压力变化时调用"""
-        pass
+        """压力变化回调方法
+
+        Args:
+            pressure: 新的内存压力值 (0.0-1.0)
+        """
+        ...
 
 
 class MemoryPressureManager:
-    """
-    内存压力管理器
+    """内存压力管理器
 
     单例模式的内存压力计算和分发中心
-
-    @class MemoryPressureManager
     """
 
     _instance: Optional['MemoryPressureManager'] = None
-    _observers: list[MemoryPressureObserver] = []
-    _current_pressure: float = 0.0
-    _update_interval: Optional[asyncio.Task] = None
-    _update_threshold: float = 0.05  # 5%变化才通知
-    _update_interval_seconds: int = 10  # 10秒更新间隔
-    _is_monitoring: bool = False
+    _lock = threading.Lock()
 
-    def __new__(cls) -> 'MemoryPressureManager':
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+    def __init__(self):
+        """私有构造函数"""
+        self._observers: List[MemoryPressureObserver] = []
+        self._current_pressure: float = 0.0
+        self._update_timer: Optional[threading.Timer] = None
+        self._monitoring_active = False
 
-    def __init__(self) -> None:
-        if not hasattr(self, '_initialized'):
-            self._initialized = True
-            self._observers = []
-            self._current_pressure = 0.0
-            self._update_interval = None
-            self._is_monitoring = False
-            self.start_monitoring()
+        # 配置常量
+        self.UPDATE_THRESHOLD = 0.05  # 5%变化才通知
+        self.UPDATE_INTERVAL = 10.0   # 10秒更新间隔
+        self.TOTAL_MEMORY_BASE = 2 * 1024 * 1024 * 1024  # 2GB基准
+
+        self._start_monitoring()
 
     @classmethod
     def get_instance(cls) -> 'MemoryPressureManager':
         """获取单例实例"""
         if cls._instance is None:
-            cls._instance = cls()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
         return cls._instance
 
     def subscribe(self, observer: MemoryPressureObserver) -> None:
-        """订阅内存压力变化"""
+        """订阅内存压力变化
+
+        Args:
+            observer: 观察者实例
+        """
         if observer not in self._observers:
             self._observers.append(observer)
             # 立即通知当前压力
-            try:
-                observer.on_pressure_change(self._current_pressure)
-            except Exception as error:
-                logger.warn("Failed to notify new observer", {
-                    "error": str(error)
-                })
+            observer.on_pressure_change(self._current_pressure)
+            logger.info(f"Memory pressure observer subscribed. Total observers: {len(self._observers)}")
 
     def unsubscribe(self, observer: MemoryPressureObserver) -> None:
-        """取消订阅"""
+        """取消订阅
+
+        Args:
+            observer: 观察者实例
+        """
         if observer in self._observers:
             self._observers.remove(observer)
+            logger.info(f"Memory pressure observer unsubscribed. Total observers: {len(self._observers)}")
 
     def get_current_pressure(self) -> float:
-        """获取当前内存压力级别"""
+        """获取当前内存压力级别
+
+        Returns:
+            当前内存压力值 (0.0-1.0)
+        """
         return self._current_pressure
 
     def force_update(self) -> None:
         """强制更新内存压力"""
-        asyncio.create_task(self._update_pressure())
+        self._update_pressure()
 
-    async def start_monitoring(self) -> None:
+    def _start_monitoring(self) -> None:
         """开始监控"""
-        if self._is_monitoring:
+        if self._monitoring_active:
             return
 
-        self._is_monitoring = True
-
+        self._monitoring_active = True
         # 立即计算一次
-        await self._update_pressure()
+        self._update_pressure()
 
         # 定期更新
-        self._update_interval = asyncio.create_task(self._monitoring_loop())
+        self._schedule_next_update()
+        logger.info("Memory pressure monitoring started")
 
     def stop_monitoring(self) -> None:
         """停止监控"""
-        self._is_monitoring = False
-        if self._update_interval:
-            self._update_interval.cancel()
-            self._update_interval = None
+        self._monitoring_active = False
+        if self._update_timer:
+            self._update_timer.cancel()
+            self._update_timer = None
+        logger.info("Memory pressure monitoring stopped")
 
-    async def _monitoring_loop(self) -> None:
-        """监控循环"""
-        while self._is_monitoring:
-            try:
-                await asyncio.sleep(self._update_interval_seconds)
-                await self._update_pressure()
-            except asyncio.CancelledError:
-                break
-            except Exception as error:
-                logger.warn("Memory pressure monitoring error", {
-                    "error": str(error)
-                })
+    def _schedule_next_update(self) -> None:
+        """安排下一次更新"""
+        if not self._monitoring_active:
+            return
+
+        self._update_timer = threading.Timer(self.UPDATE_INTERVAL, self._update_pressure)
+        self._update_timer.daemon = True
+        self._update_timer.start()
 
     def _calculate_pressure(self) -> float:
-        """计算内存压力级别"""
+        """计算内存压力级别
+
+        Returns:
+            内存压力值 (0.0-1.0)
+        """
         try:
-            # 获取进程内存信息
-            process = psutil.Process()
-            memory_info = process.memory_info()
+            mem_usage = MemoryUtils.get_process_memory_info()
 
-            # 获取系统内存信息
-            system_memory = psutil.virtual_memory()
+            # 基于堆使用率计算压力
+            heap_pressure = MemoryUtils.calculate_memory_usage_percent(
+                mem_usage.get('heap_used', 0),
+                mem_usage.get('heap_total', 1)
+            )
 
-            # 基于堆使用率计算压力（模拟V8堆）
-            # 使用RSS作为堆使用率的近似
-            heap_pressure = memory_info.rss / system_memory.total
-
-            # 基于系统内存使用率计算压力
-            system_pressure = system_memory.percent / 100.0
+            # 基于RSS和系统内存计算压力
+            rss_pressure = MemoryUtils.calculate_memory_usage_percent(
+                mem_usage.get('rss', 0),
+                self.TOTAL_MEMORY_BASE
+            )
 
             # 综合压力级别，确保在0.2-1范围内
-            combined_pressure = max(heap_pressure, system_pressure)
+            combined_pressure = max(heap_pressure, rss_pressure)
             pressure = max(0.2, min(1.0, combined_pressure * 1.2))
 
-            logger.debug("Calculated memory pressure", {
-                "heap_pressure": heap_pressure,
-                "system_pressure": system_pressure,
-                "combined_pressure": combined_pressure,
-                "final_pressure": pressure,
-                "rss_mb": memory_info.rss / 1024 / 1024,
-                "system_used_percent": system_memory.percent
-            })
+            logger.debug(f"Memory pressure calculated: heap={heap_pressure:.3f}, rss={rss_pressure:.3f}, combined={combined_pressure:.3f}, final={pressure:.3f}")
 
             return pressure
 
-        except Exception as error:
-            logger.warn("Failed to calculate memory pressure", {
-                "error": str(error)
-            })
+        except Exception as e:
+            logger.warn(f"Failed to calculate memory pressure: {e}")
             return 0.5  # 默认中等压力
 
-    async def _update_pressure(self) -> None:
+    def _update_pressure(self) -> None:
         """更新内存压力并通知观察者"""
         try:
             new_pressure = self._calculate_pressure()
             pressure_change = abs(new_pressure - self._current_pressure)
 
             # 只有变化超过阈值才通知
-            if pressure_change > self._update_threshold:
+            if pressure_change > self.UPDATE_THRESHOLD:
                 old_pressure = self._current_pressure
                 self._current_pressure = new_pressure
+                self._notify_observers(new_pressure)
 
-                logger.info("Memory pressure changed", {
-                    "old_pressure": old_pressure,
-                    "new_pressure": new_pressure,
-                    "change": pressure_change
-                })
+                logger.info(f"Memory pressure updated: {old_pressure:.3f} -> {new_pressure:.3f} (change={pressure_change:.3f})")
 
-                await self._notify_observers(new_pressure)
+            # 安排下一次更新
+            self._schedule_next_update()
 
-        except Exception as error:
-            logger.warn("Failed to update memory pressure", {
-                "error": str(error)
-            })
+        except Exception as e:
+            logger.warn(f"Failed to update memory pressure: {e}")
+            # 即使出错也要安排下一次更新
+            self._schedule_next_update()
 
-    async def _notify_observers(self, pressure: float) -> None:
+    def _notify_observers(self, pressure: float) -> None:
         """通知所有观察者"""
-        for observer in self._observers[:]:  # 创建副本以防在迭代过程中修改
+        failed_count = 0
+        for observer in self._observers[:]:  # 使用切片避免修改时的问题
             try:
-                if asyncio.iscoroutinefunction(observer.on_pressure_change):
-                    await observer.on_pressure_change(pressure)
-                else:
-                    observer.on_pressure_change(pressure)
-            except Exception as error:
-                logger.warn("Memory pressure observer failed", {
-                    "observer": str(type(observer).__name__),
-                    "error": str(error)
-                })
+                observer.on_pressure_change(pressure)
+            except Exception as e:
+                failed_count += 1
+                logger.warn(f"Memory pressure observer failed: {e}")
+                # 移除失败的观察者
+                if observer in self._observers:
+                    self._observers.remove(observer)
 
-    def get_pressure_level(self) -> str:
-        """获取压力级别描述"""
-        pressure = self._current_pressure
-        if pressure < 0.3:
-            return "low"
-        elif pressure < 0.7:
-            return "medium"
-        elif pressure < 0.9:
-            return "high"
-        else:
-            return "critical"
-
-    def should_throttle_operations(self) -> bool:
-        """判断是否应该限制操作"""
-        return self._current_pressure > 0.8
-
-    def should_trigger_gc(self) -> bool:
-        """判断是否应该触发垃圾回收"""
-        return self._current_pressure > 0.7
-
-    def get_memory_stats(self) -> dict[str, Any]:
-        """获取内存统计信息"""
-        try:
-            process = psutil.Process()
-            memory_info = process.memory_info()
-            system_memory = psutil.virtual_memory()
-
-            return {
-                "process_rss_mb": memory_info.rss / 1024 / 1024,
-                "process_vms_mb": memory_info.vms / 1024 / 1024,
-                "system_total_mb": system_memory.total / 1024 / 1024,
-                "system_used_mb": system_memory.used / 1024 / 1024,
-                "system_free_mb": system_memory.free / 1024 / 1024,
-                "system_percent": system_memory.percent,
-                "pressure_level": self.get_pressure_level(),
-                "current_pressure": self._current_pressure,
-                "observer_count": len(self._observers)
-            }
-        except Exception as error:
-            logger.warn("Failed to get memory stats", {
-                "error": str(error)
-            })
-            return {
-                "error": str(error),
-                "pressure_level": self.get_pressure_level(),
-                "current_pressure": self._current_pressure
-            }
-
-    def trigger_gc_if_needed(self) -> bool:
-        """如果需要则触发垃圾回收"""
-        if self.should_trigger_gc():
-            collected = gc.collect()
-            logger.info("GC triggered due to high memory pressure", {
-                "objects_collected": collected,
-                "pressure": self._current_pressure
-            })
-            return True
-        return False
+        if failed_count > 0:
+            logger.warn(f"Failed to notify {failed_count} memory pressure observers")
 
 
 # 导出单例实例

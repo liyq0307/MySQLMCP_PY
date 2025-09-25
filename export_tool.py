@@ -20,7 +20,7 @@ import pandas as pd
 
 from mysql_manager import MySQLManager
 from monitor import MemoryMonitor
-from typeUtils import ExportOptions, ExportResult
+from type_utils import ExportOptions, ExportResult
 from logger import logger
 
 

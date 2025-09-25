@@ -21,7 +21,7 @@ from uuid import uuid4
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from typeUtils import ErrorSeverity
+from type_utils import ErrorSeverity
 
 
 class SecurityEventType(str, Enum):

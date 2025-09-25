@@ -31,7 +31,7 @@ from cache import CacheRegion
 from error_handler import ErrorHandler
 from logger import logger
 from monitor import MemoryMonitor
-from typeUtils import (
+from type_utils import (
     BackupOptions, BackupResult, ExportOptions, ExportResult,
     ReportConfig, IncrementalBackupOptions, IncrementalBackupResult,
     ProgressTracker, TaskQueue, BackupVerificationResult, ErrorCategory, MySQLMCPError

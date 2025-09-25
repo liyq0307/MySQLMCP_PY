@@ -28,13 +28,15 @@ class ToolWrapperOptions:
         operation_type: str,
         error_message: Optional[str] = None,
         enable_performance_monitoring: bool = True,
-        enable_rate_limiting: bool = True
+        enable_rate_limiting: bool = True,
+        required_permissions: Optional[list] = None
     ):
         self.tool_name = tool_name
         self.operation_type = operation_type
         self.error_message = error_message
         self.enable_performance_monitoring = enable_performance_monitoring
         self.enable_rate_limiting = enable_rate_limiting
+        self.required_permissions = required_permissions or []
 
 
 def check_rate_limit(args: Dict, operation_type: str) -> bool:
@@ -97,6 +99,31 @@ def get_rate_limit_status(args: Dict, operation_type: str) -> Dict:
         }
 
 
+def check_permissions(required_permissions: list, user_id: str = 'admin') -> bool:
+    """检查用户权限
+
+    @param required_permissions: 所需的权限列表
+    @param user_id: 用户ID，默认为admin
+    @return: 是否有权限
+    """
+    if not required_permissions:
+        return True  # 无权限要求
+
+    try:
+        from rbac import rbac_manager
+
+        # 检查用户是否有任一所需权限
+        for permission in required_permissions:
+            if rbac_manager.check_permission(user_id, permission):
+                return True
+
+        return False
+
+    except Exception as e:
+        logger.warn(f"权限检查失败，使用默认策略: {e}")
+        return True  # 权限检查失败时默认允许
+
+
 def create_tool_handler(
     handler: Callable[[T], str],
     options: ToolWrapperOptions
@@ -119,10 +146,19 @@ def create_tool_handler(
             start_time = time.time()
 
         try:
+            # 权限检查
+            if not check_permissions(options.required_permissions):
+                from type_utils import MySQLMCPError, ErrorCategory, ErrorSeverity
+                raise MySQLMCPError(
+                    f"权限不足：需要权限 {options.required_permissions}",
+                    ErrorCategory.ACCESS_DENIED,
+                    ErrorSeverity.HIGH
+                )
+
             # 限流检查
             if enable_rate_limiting and not check_rate_limit(args, operation_type):
                 rate_status = get_rate_limit_status(args, operation_type)
-                from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+                from type_utils import MySQLMCPError, ErrorCategory, ErrorSeverity
                 raise MySQLMCPError(
                     STRING_CONSTANTS["MSG_RATE_LIMIT_EXCEEDED"],
                     ErrorCategory.RATE_LIMIT_ERROR,
@@ -154,7 +190,7 @@ def create_tool_handler(
             logger.error(f"{final_error_message}: {str(e)}")
 
             # 如果是MySQLMCPError，保持原样
-            from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+            from type_utils import MySQLMCPError, ErrorCategory, ErrorSeverity
             if isinstance(e, MySQLMCPError):
                 raise
 
@@ -176,6 +212,7 @@ class ToolDefinition(BaseModel):
     handler: Callable[[Any], str]
     error_message: Optional[str] = None
     operation_type: str = "general"
+    required_permissions: Optional[list] = None
 
 
 def create_mcp_tool(definition: ToolDefinition) -> Dict[str, Any]:
@@ -195,7 +232,8 @@ def create_mcp_tool(definition: ToolDefinition) -> Dict[str, Any]:
             ToolWrapperOptions(
                 tool_name=definition.name,
                 operation_type=definition.operation_type,
-                error_message=definition.error_message
+                error_message=definition.error_message,
+                required_permissions=definition.required_permissions
             )
         )
     }

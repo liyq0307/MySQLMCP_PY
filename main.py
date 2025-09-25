@@ -33,7 +33,7 @@ from backup_tool import MySQLBackupTool
 from import_tool import MySQLImportTool
 from rate_limit import RateLimiterManager
 from config import config_manager
-from typeUtils import ErrorCategory, ErrorSeverity, MySQLMCPError, RateLimitConfig
+from type_utils import ErrorCategory, ErrorSeverity, MySQLMCPError, RateLimitConfig
 
 # 创建MySQL管理器实例
 mysql_manager = MySQLManager()
@@ -861,7 +861,7 @@ async def mysql_batch_execute(args: BatchExecuteParams) -> str:
         # 检查批量操作的速率限制（批量操作更严格）
         if not check_rate_limit(args, "batch_execute"):
             rate_status = get_rate_limit_status(args, "batch_execute")
-            from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+            from type_utils import MySQLMCPError, ErrorCategory, ErrorSeverity
             raise MySQLMCPError(
                 STRING_CONSTANTS["MSG_RATE_LIMIT_EXCEEDED"],
                 ErrorCategory.RATE_LIMIT_ERROR,
@@ -984,7 +984,7 @@ async def mysql_alter_table(args: AlterTableParams) -> str:
     @return: JSON格式的修改结果，包含操作统计、性能指标和执行详情
     @throws: MySQLMCPError 当表名无效、修改操作有误或执行失败时
     """
-    from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+    from type_utils import MySQLMCPError, ErrorCategory, ErrorSeverity
 
     start_time = time.time()
     mysql_manager.validate_table_name(args.table_name)
@@ -1419,7 +1419,7 @@ async def mysql_import_data(args: ImportDataParams) -> str:
     """数据导入"""
     try:
         import pandas as pd
-        from typeUtils import ImportResult, ErrorCategory, ErrorSeverity, MySQLMCPError
+        from type_utils import ImportResult, ErrorCategory, ErrorSeverity, MySQLMCPError
 
         start_time = time.time()
 
@@ -2963,7 +2963,7 @@ async def mysql_export_data(args: ExportDataParams) -> str:
         # 检查导出操作的速率限制
         if not check_rate_limit(args, "export"):
             rate_status = get_rate_limit_status(args, "export")
-            from typeUtils import MySQLMCPError, ErrorCategory, ErrorSeverity
+            from type_utils import MySQLMCPError, ErrorCategory, ErrorSeverity
             raise MySQLMCPError(
                 STRING_CONSTANTS["MSG_RATE_LIMIT_EXCEEDED"],
                 ErrorCategory.RATE_LIMIT_ERROR,
@@ -2976,7 +2976,7 @@ async def mysql_export_data(args: ExportDataParams) -> str:
 
         import pandas as pd
         from pathlib import Path
-        from typeUtils import ExportResult, ErrorCategory, ErrorSeverity, MySQLMCPError
+        from type_utils import ExportResult, ErrorCategory, ErrorSeverity, MySQLMCPError
 
         start_time = time.time()
 

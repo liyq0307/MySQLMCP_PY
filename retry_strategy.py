@@ -5,11 +5,18 @@
 为Model Context Protocol (MCP)提供安全、可靠、高效的数据库操作重试服务，
 支持企业级应用的所有重试需求。
 
+主要特性:
+- 基于错误类别和严重级别的智能重试决策
+- 指数退避算法支持抖动避免雪崩效应
+- 完整的重试统计和监控功能
+- 自定义重试条件和策略支持
+- 结构化日志记录和错误追踪
+
 @fileoverview 智能重试策略系统 - 企业级错误恢复解决方案
 @author liyq
-@version 1.0.0
+@version 2.0.0
 @since 1.0.0
-@updated 2025-09-23
+@updated 2025-09-25
 @license MIT
 """
 
@@ -17,17 +24,21 @@ import asyncio
 import random
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, TypeVar, Generic
+from typing import Any, Callable, Dict, List, Optional, TypeVar, Generic, Protocol
 from dataclasses import dataclass, field
 
-from typeUtils import ErrorCategory, ErrorSeverity, MySQLMCPError
+from type_utils import ErrorCategory, ErrorSeverity, MySQLMCPError
 from logger import logger
 
 T = TypeVar('T')
 
-@dataclass
+class RetryCondition(Protocol):
+    """重试条件函数协议"""
+    def __call__(self, error: Exception, attempt: int) -> bool: ...
+
+@dataclass(frozen=True)
 class RetryStrategy:
-    """重试策略配置"""
+    """重试策略配置 - 不可变配置对象"""
     max_attempts: int = 3
     base_delay: int = 1000  # 毫秒
     max_delay: int = 30000  # 毫秒
@@ -35,11 +46,11 @@ class RetryStrategy:
     jitter: bool = True
     retryable_errors: Optional[List[str]] = None
     non_retryable_errors: Optional[List[str]] = None
-    condition: Optional[Callable[[Exception, int], bool]] = None
+    condition: Optional[RetryCondition] = None
 
-@dataclass
+@dataclass(frozen=True)
 class RetryResult(Generic[T]):
-    """重试结果"""
+    """重试结果 - 不可变结果对象"""
     success: bool
     attempts: int
     total_delay: int
@@ -47,9 +58,9 @@ class RetryResult(Generic[T]):
     last_error: Optional[Exception] = None
     retry_history: List[Dict[str, Any]] = field(default_factory=list)
 
-@dataclass
+@dataclass(frozen=True)
 class RetryStats:
-    """重试统计信息"""
+    """重试统计信息 - 不可变统计对象"""
     total_operations: int = 0
     successful_operations: int = 0
     failed_operations: int = 0
@@ -72,6 +83,14 @@ class RetryContext:
     delay: int
     operation_id: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
+
+@dataclass
+class RetryAttemptRecord:
+    """重试尝试记录"""
+    attempt: int
+    error: Optional[Exception] = None
+    delay: int = 0
+    timestamp: float = 0.0
 
 
 class SmartRetryStrategy:
@@ -145,8 +164,46 @@ class SmartRetryStrategy:
         ErrorSeverity.FATAL: RetryStrategy(max_attempts=0, base_delay=0, max_delay=0)
     }
 
-    # 重试统计
+    # 重试统计 - 使用更高效的数据结构
     _retry_stats: Dict[str, Dict[str, Any]] = {}
+
+    @classmethod
+    def _init_retry_stats(cls, operation_id: str) -> None:
+        """初始化重试统计 - 优化版本"""
+        if operation_id not in cls._retry_stats:
+            cls._retry_stats[operation_id] = {
+                "total_attempts": 0,
+                "successful_retries": 0,
+                "failed_retries": 0,
+                "average_retry_time": 0.0,
+                "last_retry_time": datetime.now(),
+                "error_counts": {},
+                "retry_intervals": []
+            }
+
+    @classmethod
+    def _update_retry_stats(cls, operation_id: str, success: bool, duration: int) -> None:
+        """更新重试统计 - 增强版本"""
+        stats = cls._retry_stats.get(operation_id)
+        if not stats:
+            return
+
+        stats["total_attempts"] += 1
+        current_time = datetime.now()
+
+        if success:
+            stats["successful_retries"] += 1
+        else:
+            stats["failed_retries"] += 1
+
+        # 计算平均重试时间
+        if duration > 0:
+            total_attempts = stats["total_attempts"]
+            stats["average_retry_time"] = (
+                (stats["average_retry_time"] * (total_attempts - 1)) + duration
+            ) / total_attempts
+
+        stats["last_retry_time"] = current_time
 
     @classmethod
     async def execute_with_retry(
@@ -167,11 +224,14 @@ class SmartRetryStrategy:
         operation_id = context.get('operation', 'anonymous') if context else 'anonymous'
         attempts = 0
         total_delay = 0
-        last_error: Optional[Exception] = None
+        last_error: Optional[MySQLMCPError] = None
         retry_history: List[Dict[str, Any]] = []
 
         # 初始化统计
         cls._init_retry_stats(operation_id)
+
+        # 记录操作开始时间
+        operation_start_time = time.time()
 
         while attempts < strategy.max_attempts:
             attempts += 1
@@ -253,6 +313,14 @@ class SmartRetryStrategy:
         non_retryable_categories: List[str],
         base_config: Optional[Dict[str, Any]] = None
     ) -> RetryStrategy:
+        """
+        创建分类特定的重试策略
+
+        @param retryable_categories: 可重试的错误类别列表
+        @param non_retryable_categories: 不可重试的错误类别列表
+        @param base_config: 基础配置选项
+        @return: 定制的重试策略
+        """
         """创建分类特定的重试策略"""
         config = base_config or {}
         return RetryStrategy(
@@ -287,11 +355,36 @@ class SmartRetryStrategy:
 
     @classmethod
     def get_retry_stats(cls, operation_id: Optional[str] = None) -> Dict[str, Any]:
-        """获取重试统计信息"""
+        """获取重试统计信息 - 增强版本"""
         if operation_id:
-            return cls._retry_stats.get(operation_id, {})
+            stats = cls._retry_stats.get(operation_id, {})
+            if stats:
+                # 计算成功率
+                total = stats.get("successful_retries", 0) + stats.get("failed_retries", 0)
+                if total > 0:
+                    stats = dict(stats)  # 创建副本避免修改原数据
+                    stats["success_rate"] = stats["successful_retries"] / total
+                return stats
+            return {}
 
-        return dict(cls._retry_stats)
+        # 返回所有统计的汇总
+        all_stats = dict(cls._retry_stats)
+        total_success = 0
+        total_failures = 0
+
+        for stats in all_stats.values():
+            total_success += stats.get("successful_retries", 0)
+            total_failures += stats.get("failed_retries", 0)
+
+        if total_success + total_failures > 0:
+            all_stats["_summary"] = {
+                "total_operations": total_success + total_failures,
+                "total_success": total_success,
+                "total_failures": total_failures,
+                "overall_success_rate": total_success / (total_success + total_failures)
+            }
+
+        return all_stats
 
     @classmethod
     def reset_retry_stats(cls, operation_id: Optional[str] = None) -> None:
@@ -320,24 +413,36 @@ class SmartRetryStrategy:
 
     @classmethod
     def _should_retry(cls, error: MySQLMCPError, attempt: int, strategy: RetryStrategy) -> bool:
-        """判断是否应该重试"""
-        # 检查是否超过最大尝试次数
+        """判断是否应该重试 - 优化的重试决策逻辑"""
+        # 1. 检查是否超过最大尝试次数
         if attempt >= strategy.max_attempts:
             return False
 
-        # 检查错误严重级别
+        # 2. 检查错误严重级别 - FATAL 错误绝不重试
         if error.severity == ErrorSeverity.FATAL:
             return False
 
-        # 检查不可重试的错误类别
+        # 3. 检查不可重试的错误类别
         if strategy.non_retryable_errors and error.category in strategy.non_retryable_errors:
             return False
 
-        # 检查可重试的错误类别
+        # 4. 检查可重试的错误类别
         if strategy.retryable_errors and error.category in strategy.retryable_errors:
             # 检查自定义条件
             if strategy.condition:
-                return strategy.condition(error, attempt)
+                try:
+                    return strategy.condition(error, attempt)
+                except Exception as e:
+                    # 自定义条件函数出错时，默认为不重试
+                    logger.warn(f"自定义重试条件函数执行出错: {e}")
+                    return False
+            return True
+
+        # 5. 基于严重级别的默认重试策略
+        # 对于未明确分类的错误，使用严重级别来决定
+        severity_strategy = cls.SEVERITY_BASED_STRATEGIES.get(error.severity, RetryStrategy())
+        if attempt <= severity_strategy.max_attempts:
+            # 检查是否还有剩余尝试次数
             return True
 
         # 默认不重试
@@ -364,7 +469,7 @@ class SmartRetryStrategy:
                 "total_attempts": 0,
                 "successful_retries": 0,
                 "failed_retries": 0,
-                "average_retry_time": 0,
+                "average_retry_time": 0.0,
                 "last_retry_time": datetime.now()
             }
 
@@ -399,23 +504,139 @@ class SmartRetryStrategy:
         delay: int,
         context: Optional[Dict[str, Any]] = None
     ) -> None:
-        """记录重试尝试日志"""
+        """记录重试尝试日志 - 结构化日志"""
         log_message = f"重试尝试 [{operation_id}] - 第{attempt}次尝试: {error.message}，等待{delay}ms"
 
         log_data = {
             "operation_id": operation_id,
             "attempt": attempt,
-            "error_category": error.category.value,
-            "error_severity": error.severity.value,
+            "error_category": error.category.value if hasattr(error.category, 'value') else str(error.category),
+            "error_severity": error.severity.value if hasattr(error.severity, 'value') else str(error.severity),
             "delay": delay,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
+            "retry_type": "structured"
         }
 
         if context:
             log_data.update(context)
 
-        logger.warn(f"Retry attempt: {log_message}", extra=log_data)
+        # 使用结构化日志
+        logger.warn("Retry attempt", extra={
+            "message": log_message,
+            "operation_id": operation_id,
+            "attempt": attempt,
+            "error_category": error.category.value if hasattr(error.category, 'value') else str(error.category),
+            "error_severity": error.severity.value if hasattr(error.severity, 'value') else str(error.severity),
+            "delay": delay,
+            "context": context or {}
+        })
 
+
+    @classmethod
+    def create_default_strategy(cls) -> RetryStrategy:
+        """创建默认重试策略"""
+        return cls.DEFAULT_STRATEGY
+
+    @classmethod
+    def create_conservative_strategy(cls) -> RetryStrategy:
+        """创建保守重试策略（较少重试）"""
+        return RetryStrategy(
+            max_attempts=2,
+            base_delay=2000,
+            max_delay=10000,
+            backoff_multiplier=1.5,
+            jitter=True
+        )
+
+    @classmethod
+    def create_aggressive_strategy(cls) -> RetryStrategy:
+        """创建激进重试策略（更多重试）"""
+        return RetryStrategy(
+            max_attempts=8,
+            base_delay=500,
+            max_delay=60000,
+            backoff_multiplier=1.8,
+            jitter=True
+        )
+
+    @classmethod
+    def validate_strategy(cls, strategy: RetryStrategy) -> bool:
+        """验证重试策略配置"""
+        if strategy.max_attempts < 1:
+            return False
+        if strategy.base_delay < 0 or strategy.max_delay < strategy.base_delay:
+            return False
+        if strategy.backoff_multiplier <= 1.0:
+            return False
+        return True
+
+    @classmethod
+    def get_operation_summary(cls, operation_id: str) -> Optional[Dict[str, Any]]:
+        """获取操作的详细统计摘要"""
+        stats = cls._retry_stats.get(operation_id)
+        if not stats:
+            return None
+
+        total_attempts = stats.get("total_attempts", 0)
+        successful_retries = stats.get("successful_retries", 0)
+        failed_retries = stats.get("failed_retries", 0)
+
+        return {
+            "operation_id": operation_id,
+            "total_attempts": total_attempts,
+            "successful_retries": successful_retries,
+            "failed_retries": failed_retries,
+            "success_rate": successful_retries / total_attempts if total_attempts > 0 else 0,
+            "average_retry_time": stats.get("average_retry_time", 0),
+            "last_retry_time": stats.get("last_retry_time")
+        }
+
+
+"""
+使用示例:
+
+1. 基本使用:
+   async def risky_operation():
+       # 你的数据库操作或网络请求
+       return await db.query("SELECT * FROM users")
+
+   result = await smart_retry_strategy.execute_with_retry(risky_operation)
+
+2. 自定义策略:
+   custom_strategy = RetryStrategy(
+       max_attempts=5,
+       base_delay=2000,
+       backoff_multiplier=1.5
+   )
+
+   result = await smart_retry_strategy.execute_with_retry(
+       risky_operation,
+       custom_strategy=custom_strategy,
+       context={"operation": "user_query", "user_id": "123"}
+   )
+
+3. 分类特定策略:
+   strategy = smart_retry_strategy.create_category_specific_strategy(
+       retryable_categories=[ErrorCategory.CONNECTION_ERROR, ErrorCategory.TIMEOUT_ERROR],
+       non_retryable_categories=[ErrorCategory.AUTHENTICATION_ERROR]
+   )
+
+4. 获取统计信息:
+   stats = smart_retry_strategy.get_retry_stats("user_query")
+   summary = smart_retry_strategy.get_operation_summary("user_query")
+"""
+
+# 导出公共接口
+__all__ = [
+    'RetryStrategy',
+    'RetryResult',
+    'RetryStats',
+    'RetryContext',
+    'RetryAttemptRecord',
+    'RetryCondition',
+    'SmartRetryStrategy',
+    'smart_retry_strategy'
+]
 
 # 创建全局重试策略实例
 smart_retry_strategy = SmartRetryStrategy()

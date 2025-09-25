@@ -15,7 +15,7 @@ from mysql_manager import MySQLManager
 from connection import ConnectionPool
 from config import ConfigurationManager
 from cache import CacheManager
-from typeUtils import (
+from type_utils import (
     MySQLMCPError, ErrorSeverity, ErrorCategory, ValidationLevel,
     QueryResult, BackupOptions, ExportOptions, ImportOptions,
     # RBAC相关类型
@@ -51,7 +51,7 @@ from retry_strategy import smart_retry_strategy, SmartRetryStrategy
 from security import SecurityValidator, SecurityAuditor, security_pattern_detector
 from rate_limit import TokenBucketRateLimiter, AdaptiveRateLimiter
 from queue_manager import queue_manager, QueueManager
-from exporter import exporter_factory, ExporterFactory, BaseExporter
+from export_tool import exporter_factory, ExporterFactory, BaseExporter
 
 __all__ = [
     # 核心模块

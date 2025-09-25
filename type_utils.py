@@ -685,7 +685,6 @@ class Role(BaseModel):
     name: str
     description: Optional[str] = None
     permissions: List[Permission]
-    is_system: Optional[bool] = False
     created_at: datetime
     updated_at: datetime
 
