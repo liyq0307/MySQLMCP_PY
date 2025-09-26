@@ -16,17 +16,14 @@ import asyncio
 import csv
 import io
 import json
-import os
 import re
-import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import aiofiles
 import openpyxl
-from openpyxl import Workbook
 
 from mysql_manager import MySQLManager
 from type_utils import (
@@ -35,18 +32,15 @@ from type_utils import (
     ValidationResult,
     FieldMapping,
     ImportProgress,
-    DuplicateCheckConfig,
     DuplicateCacheItem,
     CandidateKey,
-    ColumnDefinition,
-    TableSchemaInfo,
     MySQLMCPError,
     ErrorCategory,
     ErrorSeverity
 )
 from common_utils import TimeUtils
 from logger import logger
-from cache import CacheManager, CacheRegion
+from cache import CacheManager
 from error_handler import safe_error as safe_error_handler
 
 

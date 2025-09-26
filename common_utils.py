@@ -107,6 +107,51 @@ class TimeUtils:
         return current_time > expiration_time
 
 
+class IdUtils:
+    """ID生成工具类"""
+
+    @staticmethod
+    def generate_uuid() -> str:
+        """生成UUID"""
+        import uuid
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def generate_short_id() -> str:
+        """生成短ID（基于时间戳和随机数）"""
+        import random
+        # 使用高精度计数器获取时间戳
+        timestamp_36 = int(time.perf_counter() * 1000)
+        # 生成8位随机数（36进制）
+        random_part = random.randint(0, 36**8 - 1)
+        return f"{timestamp_36:x}{random_part:08x}"
+
+
+class PerformanceUtils:
+    """性能监控工具类"""
+
+    @staticmethod
+    def create_timer():
+        """创建性能计时器"""
+        start_time = time.perf_counter() * 1000  # 毫秒
+        return {
+            'start': start_time,
+            'get_elapsed': lambda: (time.perf_counter() * 1000 - start_time) / 1000,  # 秒
+            'get_elapsed_ms': lambda: time.perf_counter() * 1000 - start_time  # 毫秒
+        }
+
+    @staticmethod
+    async def measure_async_execution(fn):
+        """异步函数执行时间测量"""
+        timer = PerformanceUtils.create_timer()
+        result = await fn()
+        return {
+            'result': result,
+            'duration_ms': timer['get_elapsed_ms'](),
+            'duration_seconds': timer['get_elapsed']()
+        }
+
+
 class MemoryUtils:
     """内存工具类"""
 

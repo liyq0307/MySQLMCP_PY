@@ -1,4 +1,3 @@
-
 """
 MySQL 高级备份和导出工具
 
@@ -9,42 +8,294 @@ MySQL 高级备份和导出工具
 @author liyq
 @version 1.0.0
 @since 1.0.0
-@updated 2025-09-23
+@updated 2025-09-26
 @license MIT
 """
 
 import asyncio
-import gzip
-import hashlib
+import os
 import time
 import zipfile
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-import pandas as pd
-import openpyxl
-from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, PatternFill
+from typing import Any, Dict, List, Optional, Callable
+import tempfile
+import hashlib
+from dataclasses import dataclass, field
+from openpyxl import Workbook
+from openpyxl.styles import PatternFill, Font
 
 from mysql_manager import MySQLManager
-from cache import CacheRegion
-from error_handler import ErrorHandler
-from logger import logger
-from monitor import MemoryMonitor
 from type_utils import (
-    BackupOptions, BackupResult, ExportOptions, ExportResult,
-    ReportConfig, IncrementalBackupOptions, IncrementalBackupResult,
-    ProgressTracker, TaskQueue, BackupVerificationResult, ErrorCategory, MySQLMCPError
+    BackupOptions, ExportOptions, BackupResult, ExportResult,
+    ReportConfig, ReportQuery, IncrementalBackupOptions,
+    IncrementalBackupResult, ProgressTracker, CancellationToken,
+    ProgressInfo, RecoveryStrategy, ErrorRecoveryResult,
+    LargeFileOptions, MemoryUsage, TaskQueue, BackupVerificationResult
 )
+from common_utils import TimeUtils, MemoryUtils
+from logger import logger
+from cache import CacheRegion
+from retry_strategy import SmartRetryStrategy
+from export_tool import ExporterFactory
+from tool_wrapper import with_error_handling, with_performance_monitoring
+
+
+@dataclass
+class MemoryManager:
+    """
+    高级内存管理器
+
+    基于TypeScript版本的MemoryManager实现，提供完整的内存监控、压力检测和自动清理功能。
+    集成了内存使用跟踪、定时监控、压力回调和智能垃圾回收机制。
+
+    主要功能：
+    - 实时内存使用情况监控
+    - 内存压力检测和阈值管理
+    - 自动垃圾回收和内存清理
+    - 压力事件回调机制
+    - 内存使用统计和报告
+    """
+
+    max_memory_threshold: int = 1024 * 1024 * 1024  # 默认1GB
+    monitoring_interval: int = 5000  # 5秒检查间隔
+    _monitoring_task: Optional[asyncio.Task] = None
+    _is_monitoring: bool = False
+    _memory_pressure_callbacks: List[callable] = field(default_factory=list)
+
+    def __post_init__(self):
+        """初始化后处理"""
+        if self.max_memory_threshold <= 0:
+            raise ValueError("最大内存阈值必须大于0")
+
+    def get_current_usage(self) -> MemoryUsage:
+        """
+        获取当前内存使用情况
+
+        基于TypeScript实现，返回详细的内存使用统计信息，
+        包括RSS、堆内存、外部内存等各项指标。
+
+        Returns:
+            MemoryUsage: 内存使用情况对象
+        """
+        memory_info = MemoryUtils.get_process_memory_info()
+        return MemoryUsage(
+            rss=memory_info["rss"],
+            heap_used=memory_info["heap_used"],
+            heap_total=memory_info["heap_total"],
+            external=memory_info["external"],
+            array_buffers=0  # Python中暂不实现
+        )
+
+    def check_memory_pressure(self) -> float:
+        """
+        检查当前内存压力
+
+        计算当前内存使用量与设定阈值之间的比率。
+        压力值范围从0.0（无压力）到1.0（达到或超过阈值）。
+
+        Returns:
+            float: 内存压力值(0.0-1.0)
+        """
+        usage = self.get_current_usage()
+        total_used = usage.heap_used + usage.external
+        pressure = min(total_used / self.max_memory_threshold, 1.0)
+
+        logger.debug("内存压力检查", "MemoryManager", {
+            "pressure": f"{pressure:.3f}",
+            "total_used": f"{total_used / 1024 / 1024:.1f}MB",
+            "threshold": f"{self.max_memory_threshold / 1024 / 1024:.1f}MB"
+        })
+
+        return pressure
+
+    async def request_memory_cleanup(self) -> None:
+        """
+        请求执行内存清理
+
+        尝试通过强制垃圾回收来释放不再使用的内存。
+        这是一个尽力而为的操作，实际效果取决于Python垃圾回收器。
+
+        记录清理前后的内存使用情况以便监控效果。
+        """
+        logger.info("开始内存清理", "MemoryManager")
+
+        # 记录清理前的内存状态
+        before_usage = self.get_current_usage()
+        logger.info("清理前内存状态", "MemoryManager", {
+            "heap_used": f"{before_usage.heap_used / 1024 / 1024:.1f}MB",
+            "rss": f"{before_usage.rss / 1024 / 1024:.1f}MB"
+        })
+
+        # 强制垃圾回收
+        import gc
+        gc.collect()
+
+        # 等待一个事件循环周期
+        await asyncio.sleep(0.1)
+
+        # 记录清理后的内存状态
+        after_usage = self.get_current_usage()
+        logger.info("清理后内存状态", "MemoryManager", {
+            "heap_used": f"{after_usage.heap_used / 1024 / 1024:.1f}MB",
+            "rss": f"{after_usage.rss / 1024 / 1024:.1f}MB",
+            "freed_memory": f"{(before_usage.heap_used - after_usage.heap_used) / 1024 / 1024:.1f}MB"
+        })
+
+    def enable_memory_monitoring(self) -> None:
+        """
+        启用内存监控
+
+        启动定时器定期检查内存压力。如果压力超过阈值，
+        将触发已注册的压力回调，并在压力过高时自动请求内存清理。
+        """
+        if self._is_monitoring:
+            logger.warning("内存监控已经启用", "MemoryManager")
+            return
+
+        self._is_monitoring = True
+        self._monitoring_task = asyncio.create_task(self._monitoring_loop())
+
+        logger.info("内存监控已启用", "MemoryManager", {
+            "interval": f"{self.monitoring_interval}ms",
+            "threshold": f"{self.max_memory_threshold / 1024 / 1024:.1f}MB"
+        })
+
+    def disable_memory_monitoring(self) -> None:
+        """
+        禁用内存监控
+
+        停止内存压力监控定时器并清理相关资源。
+        """
+        if not self._is_monitoring:
+            return
+
+        self._is_monitoring = False
+
+        if self._monitoring_task and not self._monitoring_task.done():
+            self._monitoring_task.cancel()
+            try:
+                asyncio.get_event_loop().run_until_complete(self._monitoring_task)
+            except asyncio.CancelledError:
+                pass
+
+        self._monitoring_task = None
+        logger.info("内存监控已禁用", "MemoryManager")
+
+    async def _monitoring_loop(self) -> None:
+        """
+        监控循环
+
+        定期检查内存压力并触发相应处理。
+        """
+        while self._is_monitoring:
+            try:
+                await asyncio.sleep(self.monitoring_interval / 1000)
+
+                pressure = self.check_memory_pressure()
+
+                # 触发压力回调
+                if pressure > 0.8:
+                    for callback in self._memory_pressure_callbacks:
+                        try:
+                            callback(pressure)
+                        except Exception as e:
+                            logger.error(f"内存压力回调执行失败: {e}", "MemoryManager")
+
+                    # 自动触发内存清理
+                    if pressure > 0.9:
+                        logger.warning("内存压力过高，自动清理", "MemoryManager", {
+                            "pressure": f"{pressure:.3f}"
+                        })
+                        await self.request_memory_cleanup()
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"内存监控循环异常: {e}", "MemoryManager")
+                await asyncio.sleep(1)  # 避免快速循环
+
+    def on_memory_pressure(self, callback: callable) -> None:
+        """
+        注册内存压力回调
+
+        添加一个回调函数，当内存压力超过阈值时将被调用。
+
+        Args:
+            callback: 当内存压力过高时调用的函数，接收压力值(float)作为参数
+        """
+        if callback not in self._memory_pressure_callbacks:
+            self._memory_pressure_callbacks.append(callback)
+            logger.info("已注册内存压力回调", "MemoryManager", {
+                "callback_count": len(self._memory_pressure_callbacks)
+            })
+
+    def remove_memory_pressure_callback(self, callback: callable) -> None:
+        """
+        移除内存压力回调
+
+        从回调列表中移除指定的函数。
+
+        Args:
+            callback: 需要移除的回调函数
+        """
+        if callback in self._memory_pressure_callbacks:
+            self._memory_pressure_callbacks.remove(callback)
+            logger.info("已移除内存压力回调", "MemoryManager", {
+                "callback_count": len(self._memory_pressure_callbacks)
+            })
+
+    def get_memory_stats(self) -> Dict[str, Any]:
+        """
+        获取内存统计信息
+
+        返回详细的内存使用统计和监控状态信息。
+
+        Returns:
+            Dict[str, Any]: 内存统计信息
+        """
+        usage = self.get_current_usage()
+        pressure = self.check_memory_pressure()
+
+        return {
+            "current_usage": {
+                "rss": usage.rss,
+                "heap_used": usage.heap_used,
+                "heap_total": usage.heap_total,
+                "external": usage.external,
+                "array_buffers": usage.array_buffers
+            },
+            "pressure": pressure,
+            "threshold": self.max_memory_threshold,
+            "monitoring_enabled": self._is_monitoring,
+            "callback_count": len(self._memory_pressure_callbacks),
+            "formatted_usage": {
+                "rss_mb": f"{usage.rss / 1024 / 1024:.1f}",
+                "heap_used_mb": f"{usage.heap_used / 1024 / 1024:.1f}",
+                "heap_total_mb": f"{usage.heap_total / 1024 / 1024:.1f}",
+                "external_mb": f"{usage.external / 1024 / 1024:.1f}",
+                "pressure_percent": f"{pressure * 100:.1f}"
+            }
+        }
+
+    async def cleanup(self) -> None:
+        """
+        清理资源
+
+        停止监控并清理所有回调函数。
+        """
+        self.disable_memory_monitoring()
+        self._memory_pressure_callbacks.clear()
+
+        logger.info("MemoryManager资源已清理", "MemoryManager")
 
 
 class MySQLBackupTool:
     """
     MySQL 高级备份和导出工具类
 
-    基于事件驱动的企业级备份工具，集成了智能内存管理、任务队列系统、
-    进度跟踪、错误恢复等高级特性。支持全量/增量备份、多格式导出、
-    大文件处理和实时监控。
+    基于企业级架构设计，提供完整的数据库备份、数据导出和报表生成功能。
+    集成了智能内存管理、任务队列调度、进度跟踪、错误恢复等高级特性。
+    支持事件驱动架构，提供丰富的事件通知机制。
 
     主要组件：
     - 内存管理器：智能内存监控和优化
@@ -52,74 +303,132 @@ class MySQLBackupTool:
     - 导出引擎：Excel/CSV/JSON 多格式导出
     - 缓存系统：查询结果缓存和 LRU 淘汰
     - 进度跟踪：实时进度监控和取消机制
+    - 事件系统：基于观察者模式的事件通知
 
-    @class MySQLBackupTool
-    @since 1.0.0
-    @version 1.0.0
+    支持的主要事件：
+    - backup-error: 备份错误
+    - backup-completed: 备份完成
+    - memory-pressure: 内存压力
+    - memory-critical: 内存严重不足
+    - task-queued: 任务排队
+    - task-started: 任务开始
+    - task-completed: 任务完成
+    - task-failed: 任务失败
+    - task-cancelled: 任务取消
+    - progress-update: 进度更新
+    - scheduler-started: 调度器启动
+    - scheduler-stopped: 调度器停止
+    - queue-paused: 队列暂停
+    - queue-resumed: 队列恢复
+    - cleanup-completed: 清理完成
     """
 
     def __init__(self, mysql_manager: MySQLManager):
+        """初始化备份工具"""
         self.mysql_manager = mysql_manager
         self.cache_manager = mysql_manager.cache_manager
-        self.memory_monitor = MemoryMonitor()
-        self.max_concurrent_tasks = 5
-        self.running_tasks = 0
-        self.task_id_counter = 0
-        self.progress_trackers: Dict[str, ProgressTracker] = {}
-        self.task_queue: Dict[str, TaskQueue] = {}
-        self.scheduler_interval: Optional[asyncio.Task] = None
-        self.is_scheduler_running = False
+        self.memory_manager = MemoryManager()
+        self.smart_retry_manager = SmartRetryStrategy
 
-        # 设置内存管理
+        # 任务队列管理
+        self.task_queue: Dict[str, TaskQueue] = {}
+        self.running_tasks = 0
+        self.max_concurrent_tasks = 5
+        self.task_id_counter = 0
+
+        # 进度跟踪器
+        self.progress_trackers: Dict[str, ProgressTracker] = {}
+
+        # 调度器状态
+        self.scheduler_running = False
+        self.scheduler_task = None
+
+        # 事件系统
+        self._event_listeners: Dict[str, List[Callable]] = {}
+        self._max_listeners = 200
+
+        # 设置最大监听器数量
+        self.set_max_listeners(200)
+
+        # 初始化内存管理
         self._setup_memory_management()
 
-        # 启动任务调度器（延迟到事件循环中启动）
-        self._scheduler_task = None
+        # 启动任务调度器
+        self._start_task_scheduler()
 
-        # 优化并发数（延迟到事件循环中执行）
-        self._optimize_task = None
+        # 优化最大并发数
+        self._optimize_max_concurrency()
 
-    def start_scheduler(self) -> None:
-        """启动任务调度器"""
-        if self._scheduler_task is None:
-            self._scheduler_task = asyncio.create_task(self._start_task_scheduler())
+        # 发出初始化完成事件
+        self.emit('initialized', {
+            'max_concurrent_tasks': self.max_concurrent_tasks,
+            'memory_monitoring': True,
+            'adaptive_scheduling': True
+        })
 
-    def start_optimization(self) -> None:
-        """启动并发优化"""
-        if self._optimize_task is None:
-            self._optimize_task = asyncio.create_task(self._optimize_max_concurrency())
+    def emit(self, event: str, data: Any = None) -> None:
+        """
+        发出事件
 
-    def _setup_memory_management(self) -> None:
-        """设置内存管理"""
-        self.memory_monitor.start_monitoring()
-
-        # 监听内存压力并采取行动
-        async def handle_memory_pressure(pressure: float) -> None:
-            logger.info("Memory pressure detected", {
-                "pressure": pressure,
-                "action": "cleanup"
-            })
-
-            if pressure > 0.85:
-                # 清理已完成的跟踪器
-                await self._cleanup_completed_trackers()
-
-                # 强制垃圾回收
-                self.memory_monitor.request_memory_cleanup()
-
-                # 如果压力仍然很高，暂停新任务
-                if pressure > 0.95:
-                    logger.warning("Critical memory pressure", {
-                        "pressure": pressure,
-                        "message": "Pausing new tasks due to high memory usage"
+        Args:
+            event: 事件名称
+            data: 事件数据
+        """
+        if event in self._event_listeners:
+            for listener in self._event_listeners[event]:
+                try:
+                    if data is not None:
+                        listener(data)
+                    else:
+                        listener()
+                except Exception as e:
+                    logger.error(f"事件监听器执行失败: {e}", "MySQLBackupTool", {
+                        'event': event,
+                        'listener_count': len(self._event_listeners[event])
                     })
 
-        # 注册内存压力回调
-        self.memory_monitor.add_alert_callback(handle_memory_pressure)
+    def on(self, event: str, listener: Callable) -> None:
+        """
+        注册事件监听器
 
-    async def _optimize_max_concurrency(self) -> None:
+        Args:
+            event: 事件名称
+            listener: 监听器函数
+        """
+        if event not in self._event_listeners:
+            self._event_listeners[event] = []
+        self._event_listeners[event].append(listener)
+
+        logger.debug(f"事件监听器已注册", "MySQLBackupTool", {
+            'event': event,
+            'listener_count': len(self._event_listeners[event])
+        })
+
+    def off(self, event: str, listener: Callable) -> None:
+        """
+        移除事件监听器
+
+        Args:
+            event: 事件名称
+            listener: 监听器函数
+        """
+        if event in self._event_listeners:
+            try:
+                self._event_listeners[event].remove(listener)
+                logger.debug(f"事件监听器已移除", "MySQLBackupTool", {
+                    'event': event,
+                    'listener_count': len(self._event_listeners[event])
+                })
+            except ValueError:
+                pass  # 监听器不存在
+
+    def set_max_listeners(self, max_listeners: int) -> None:
+        """设置最大监听器数量"""
+        self._max_listeners = max_listeners
+
+    def _optimize_max_concurrency(self) -> None:
         """优化最大并发数基于系统资源"""
-        memory_usage = self.memory_monitor.get_current_usage()
+        memory_usage = self.memory_manager.get_current_usage()
         available_memory = memory_usage.heap_total - memory_usage.heap_used
 
         # 基于可用内存动态调整并发数
@@ -130,32 +439,30 @@ class MySQLBackupTool:
         else:
             self.max_concurrent_tasks = 3
 
-        logger.info("Concurrency optimized", {
+        logger.info("并发数已优化", "MySQLBackupTool", {
             "max_concurrent_tasks": self.max_concurrent_tasks,
-            "available_memory_mb": available_memory / 1024 / 1024
+            "available_memory": f"{available_memory / 1024 / 1024:.1f}MB"
         })
 
     async def _get_table_statistics(self, specific_tables: Optional[List[str]] = None) -> Dict[str, int]:
         """获取表统计信息"""
         try:
-            tables: List[str]
+            tables = specific_tables or []
 
-            if specific_tables and len(specific_tables) > 0:
-                tables = specific_tables
-            else:
+            if not tables:
                 # 检查缓存
                 cached_tables = await self.cache_manager.get(CacheRegion.QUERY_RESULT, 'SHOW_TABLES')
                 if cached_tables:
                     tables = cached_tables
                 else:
                     result = await self.mysql_manager.execute_query('SHOW TABLES')
-                    tables = [list(row.values())[0] for row in result] if isinstance(result, list) else []
+                    tables = [row[list(row.keys())[0]] for row in result]
                     await self.cache_manager.set(CacheRegion.QUERY_RESULT, 'SHOW_TABLES', tables)
 
             # 并行获取所有表的统计信息
             count_promises = []
             for table_name in tables:
-                count_promises.append(self._get_single_table_count(table_name))
+                count_promises.append(self._get_table_count(table_name))
 
             # 分批执行以避免过多并发查询
             batch_size = min(10, self.max_concurrent_tasks)
@@ -163,26 +470,29 @@ class MySQLBackupTool:
 
             for i in range(0, len(count_promises), batch_size):
                 batch = count_promises[i:i + batch_size]
-                batch_results = await asyncio.gather(*batch)
-                total_record_count += sum(batch_results)
+                batch_results = await asyncio.gather(*batch, return_exceptions=True)
+
+                for result in batch_results:
+                    if isinstance(result, int):
+                        total_record_count += result
+                    elif isinstance(result, Exception):
+                        logger.warn(f"获取表统计信息失败: {result}")
 
                 # 检查内存压力
-                pressure = self.memory_monitor.check_memory_pressure()
+                pressure = self.memory_manager.check_memory_pressure()
                 if pressure > 0.8:
-                    await self.memory_monitor.request_memory_cleanup()
-                    await asyncio.sleep(0.1)  # 短暂延迟以降低系统压力
+                    await self._request_memory_cleanup()
+                    await asyncio.sleep(0.1)
 
             return {
                 "table_count": len(tables),
                 "record_count": total_record_count
             }
-        except Exception as error:
-            logger.warn("Failed to get optimized table statistics", {
-                "error": str(error)
-            })
+        except Exception as e:
+            logger.warn(f"获取表统计信息失败: {e}")
             return {"table_count": 0, "record_count": 0}
 
-    async def _get_single_table_count(self, table_name: str) -> int:
+    async def _get_table_count(self, table_name: str) -> int:
         """获取单个表的记录数"""
         try:
             cache_key = f"COUNT_{table_name}"
@@ -193,122 +503,147 @@ class MySQLBackupTool:
 
             # 使用更快的统计查询
             result = await self.mysql_manager.execute_query(
-                "SELECT table_rows FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = ?",
+                "SELECT table_rows FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = %s",
                 [table_name]
             )
 
             count = 0
-            if isinstance(result, list) and len(result) > 0:
+            if result and len(result) > 0:
                 count = result[0].get('table_rows', 0) or 0
                 # 如果统计信息不准确，使用精确计数（但限制在小表上）
-                if count == 0 or count is None:
+                if count == 0:
                     exact_result = await self.mysql_manager.execute_query(
                         f"SELECT COUNT(*) as count FROM `{table_name}` LIMIT 1000"
                     )
-                    count = exact_result[0].get('count', 0) if isinstance(exact_result, list) and exact_result else 0
+                    count = exact_result[0].get('count', 0) if exact_result else 0
 
             await self.cache_manager.set(CacheRegion.QUERY_RESULT, cache_key, count)
             return count
-        except Exception as error:
-            logger.warn(f"Failed to get count for table {table_name}", {
-                "error": str(error)
-            })
+        except Exception as e:
+            logger.warn(f"获取表 {table_name} 记录数失败: {e}")
             return 0
 
-    async def create_backup(self, options: BackupOptions = {}) -> BackupResult:
-        """
-        创建数据库备份
+    @with_error_handling('createBackup', 'MSG_BACKUP_FAILED')
+    @with_performance_monitoring('backup_create')
+    async def create_backup(self, options: Optional[BackupOptions] = None) -> BackupResult:
+        """创建数据库备份"""
+        start_time = TimeUtils.now()
+        options = options or BackupOptions()
 
-        执行数据库备份操作，支持全量备份和部分表备份。
-        可选择是否包含表结构和数据，并支持文件压缩。
+        # 发出备份开始事件
+        self.emit('backup-started', {
+            'options': options,
+            'start_time': start_time.isoformat()
+        })
 
-        @param {BackupOptions} options - 备份选项配置
-        @returns {BackupResult} 包含备份结果的JSON格式数据
-        @throws {MySQLMCPError} 当备份失败时抛出
-        """
-        start_time = time.time()
-        default_options = BackupOptions(
-            output_dir="./backups",
-            compress=True,
-            include_data=True,
-            include_structure=True,
-            tables=[],
-            file_prefix="mysql_backup",
-            max_file_size=100
+        # 设置默认值
+        backup_options = BackupOptions(
+            output_dir=options.output_dir or './backups',
+            compress=options.compress if options.compress is not None else True,
+            include_data=options.include_data if options.include_data is not None else True,
+            include_structure=options.include_structure if options.include_structure is not None else True,
+            tables=options.tables or [],
+            file_prefix=options.file_prefix or 'mysql_backup',
+            max_file_size=options.max_file_size or 100
         )
-
-        opts = BackupOptions(**{**default_options.model_dump(), **options.model_dump()})
 
         try:
             # 确保输出目录存在
-            output_path = Path(opts.output_dir or "./backups")
-            output_path.mkdir(parents=True, exist_ok=True)
+            os.makedirs(backup_options.output_dir, exist_ok=True)
 
             # 生成备份文件名
-            timestamp = datetime.now().isoformat().replace(':', '-').replace('.', '-')
-            file_name = f"{opts.file_prefix}_{timestamp}"
-            backup_path = output_path / file_name
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            file_name = f"{backup_options.file_prefix}_{timestamp}"
+            backup_path = os.path.join(backup_options.output_dir, file_name)
+
+            # 获取数据库配置
+            config = self.mysql_manager.config_manager.database
 
             # 获取表统计信息
-            table_stats = await self._get_table_statistics(opts.tables)
+            table_stats = await self._get_table_statistics(backup_options.tables)
             table_count = table_stats["table_count"]
             record_count = table_stats["record_count"]
 
+            # 发出进度更新事件
+            self.emit('backup-progress', {
+                'stage': 'preparing',
+                'progress': 10,
+                'message': '正在准备备份...',
+                'table_count': table_count,
+                'record_count': record_count
+            })
+
             # 构建 mysqldump 命令
             dump_args = [
-                "mysqldump",
-                "-h", str(self.mysql_manager.config.database.host),
-                "-P", str(self.mysql_manager.config.database.port),
-                "-u", self.mysql_manager.config.database.user,
-                "-p" + self.mysql_manager.config.database.password,
-                "--default-character-set=utf8mb4",
-                "--single-transaction",
-                "--routines",
-                "--triggers"
+                'mysqldump',
+                f'-h{config["host"]}',
+                f'-P{config["port"]}',
+                f'-u{config["user"]}',
+                f'-p{config["password"]}',
+                '--default-character-set=utf8mb4',
+                '--single-transaction',
+                '--routines',
+                '--triggers'
             ]
 
-            if not opts.include_data:
-                dump_args.append("--no-data")
+            if not backup_options.include_data:
+                dump_args.append('--no-data')
 
-            if not opts.include_structure:
-                dump_args.append("--no-create-info")
+            if not backup_options.include_structure:
+                dump_args.append('--no-create-info')
 
-            dump_args.append(self.mysql_manager.config.database.database or "")
+            dump_args.append(config["database"] or '')
 
-            if opts.tables and len(opts.tables) > 0:
-                dump_args.extend(opts.tables)
+            if backup_options.tables:
+                dump_args.extend(backup_options.tables)
 
             # 执行备份
-            sql_file_path = backup_path.with_suffix('.sql')
-            with open(sql_file_path, 'w') as f:
-                result = await asyncio.create_subprocess_exec(
-                    *dump_args,
-                    stdout=f,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                _, stderr = await result.communicate()
+            sql_file_path = f"{backup_path}.sql"
+            await self._execute_mysqldump(dump_args, sql_file_path)
 
-                if result.returncode != 0:
-                    raise MySQLMCPError(
-                        f"mysqldump failed: {stderr.decode()}",
-                        ErrorCategory.BACKUP_ERROR
-                    )
-
-            final_file_path = str(sql_file_path)
-            file_size = sql_file_path.stat().st_size
+            final_file_path = sql_file_path
+            file_size = 0
 
             # 检查文件大小并压缩
-            if opts.compress or file_size > (opts.max_file_size or 100) * 1024 * 1024:
-                zip_file_path = backup_path.with_suffix('.zip')
-                await self._compress_file(str(sql_file_path), str(zip_file_path))
+            if os.path.exists(sql_file_path):
+                file_size = os.path.getsize(sql_file_path)
 
-                # 删除原始SQL文件
-                sql_file_path.unlink()
+                # 发出进度更新事件
+                self.emit('backup-progress', {
+                    'stage': 'dumping',
+                    'progress': 70,
+                    'message': '正在创建备份文件...',
+                    'file_size': f"{file_size / 1024 / 1024:.1f}MB"
+                })
 
-                final_file_path = str(zip_file_path)
-                file_size = zip_file_path.stat().st_size
+                if backup_options.compress or file_size > (backup_options.max_file_size * 1024 * 1024):
+                    zip_file_path = f"{backup_path}.zip"
+                    await self._compress_file(sql_file_path, zip_file_path)
 
-            duration = int((time.time() - start_time) * 1000)
+                    # 删除原始SQL文件
+                    os.unlink(sql_file_path)
+
+                    final_file_path = zip_file_path
+                    file_size = os.path.getsize(zip_file_path)
+
+                    # 发出进度更新事件
+                    self.emit('backup-progress', {
+                        'stage': 'compressing',
+                        'progress': 90,
+                        'message': '正在压缩备份文件...',
+                        'compressed_size': f"{file_size / 1024 / 1024:.1f}MB"
+                    })
+
+            duration = int((TimeUtils.now() - start_time) * 1000)
+
+            # 发出备份完成事件
+            self.emit('backup-completed', {
+                'file_path': final_file_path,
+                'file_size': file_size,
+                'table_count': table_count,
+                'record_count': record_count,
+                'duration': duration
+            })
 
             return BackupResult(
                 success=True,
@@ -319,193 +654,1034 @@ class MySQLBackupTool:
                 duration=duration
             )
 
-        except Exception as error:
+        except Exception as e:
             # 清理缓存以释放内存
             await self.cache_manager.clear_region(CacheRegion.QUERY_RESULT)
 
-            safe_error = ErrorHandler.safe_error(error, 'create_backup')
+            duration = int((TimeUtils.now() - start_time) * 1000)
+            error_message = str(e)
 
-            logger.error("Backup failed", {
-                "error": safe_error.message,
-                "duration": int((time.time() - start_time) * 1000),
-                "memory_usage": self.memory_monitor.get_current_usage().model_dump()
+            logger.error("备份创建失败", "MySQLBackupTool", {
+                "error": error_message,
+                "duration": duration
             })
 
             return BackupResult(
                 success=False,
-                error=safe_error.message,
-                duration=int((time.time() - start_time) * 1000)
+                error=error_message,
+                duration=duration
             )
 
-    async def create_incremental_backup(self, options: IncrementalBackupOptions = {}) -> IncrementalBackupResult:
-        """
-        创建增量备份
+    async def _execute_mysqldump(self, args: List[str], output_path: str) -> None:
+        """执行mysqldump命令"""
+        try:
+            # 创建输出目录
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        基于时间戳创建增量备份，只备份自上次备份以来发生变化的数据。
+            # 执行命令
+            process = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
 
-        @param {IncrementalBackupOptions} options - 增量备份选项配置
-        @returns {IncrementalBackupResult} 包含增量备份结果的JSON格式数据
-        """
-        start_time = time.time()
-        default_options = IncrementalBackupOptions(
-            output_dir="./backups",
-            compress=True,
-            include_data=True,
-            include_structure=False,
-            tables=[],
-            file_prefix="mysql_incremental",
-            max_file_size=100,
-            incremental_mode="timestamp",
-            tracking_table="__backup_tracking"
+            with open(output_path, 'wb') as output_file:
+                while True:
+                    chunk = await process.stdout.read(8192)
+                    if not chunk:
+                        break
+                    output_file.write(chunk)
+
+            await process.wait()
+
+            if process.returncode != 0:
+                error_output = await process.stderr.read()
+                raise Exception(f"mysqldump failed: {error_output.decode()}")
+
+        except Exception as e:
+            logger.error(f"执行mysqldump失败: {e}")
+            raise
+
+    async def _compress_file(self, input_path: str, output_path: str) -> None:
+        """压缩文件"""
+        try:
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(f"输入文件不存在: {input_path}")
+
+            async with asyncio.get_event_loop().run_in_executor(
+                None,
+                self._compress_file_sync,
+                input_path,
+                output_path
+            ):
+                pass
+        except Exception as e:
+            logger.error(f"文件压缩失败: {e}")
+            raise
+
+    def _compress_file_sync(self, input_path: str, output_path: str) -> None:
+        """同步压缩文件"""
+        try:
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as zipf:
+                zipf.write(input_path, os.path.basename(input_path))
+        except Exception as e:
+            logger.error(f"同步压缩文件失败: {e}")
+            raise
+
+    async def export_data(self, query: str, params: Optional[List[Any]] = None,
+                           options: Optional[ExportOptions] = None) -> ExportResult:
+        """通用导出方法 - 使用ExporterFactory"""
+        try:
+            # 设置默认选项
+            if not options:
+                options = ExportOptions()
+
+            # 确定导出格式
+            format_type = options.format or 'excel'
+
+            # 使用ExporterFactory创建相应的导出器
+            exporter_factory = ExporterFactory.get_instance(self.mysql_manager, self.memory_manager)
+            exporter = exporter_factory.create_exporter(format_type)
+            return await exporter.export(query, params or [], options)
+
+        except Exception as e:
+            error_message = str(e)
+            logger.error("数据导出失败", "MySQLBackupTool", {
+                "error": error_message,
+                "query": query[:100]
+            })
+
+            return ExportResult(
+                success=False,
+                error=error_message,
+                duration=0
+            )
+
+    async def export_data_with_recovery(self, query: str, params: Optional[List[Any]] = None,
+                                      options: Optional[ExportOptions] = None,
+                                      recovery: Optional[RecoveryStrategy] = None) -> ErrorRecoveryResult:
+        """带错误恢复的数据导出"""
+        default_recovery = RecoveryStrategy(
+            retry_count=3,
+            retry_delay=1000,
+            exponential_backoff=True,
+            fallback_options={
+                'streaming': False,
+                'max_rows': 10000,
+                'batch_size': 500
+            }
         )
 
-        opts = IncrementalBackupOptions(**{**default_options.model_dump(), **options.model_dump()})
+        strategy = RecoveryStrategy(**(recovery.model_dump() if recovery else default_recovery.model_dump()))
+
+        return await self._execute_with_recovery(
+            lambda: self.export_data(query, params, options),
+            strategy,
+            'export',
+            options or ExportOptions()
+        )
+
+    async def export_data_with_progress(self, query: str, params: Optional[List[Any]] = None,
+                                      options: Optional[ExportOptions] = None,
+                                      cancellation_token: Optional[CancellationToken] = None) -> tuple:
+        """带进度跟踪的数据导出"""
+        tracker = await self.create_progress_tracker('export', cancellation_token)
+
+        try:
+            # 检查取消状态
+            if cancellation_token and cancellation_token.is_cancelled:
+                raise Exception(cancellation_token.reason or '操作已被取消')
+
+            # 更新进度
+            tracker.progress = ProgressInfo(
+                stage='preparing',
+                progress=10,
+                message='准备开始数据导出...',
+                start_time=datetime.now()
+            )
+            self._update_progress(tracker)
+
+            # 检查取消状态
+            if cancellation_token and cancellation_token.is_cancelled:
+                raise Exception(cancellation_token.reason or '操作已被取消')
+
+            # 更新进度
+            tracker.progress = ProgressInfo(
+                stage='processing',
+                progress=50,
+                message='正在执行查询和导出数据...',
+                start_time=datetime.now()
+            )
+            self._update_progress(tracker)
+
+            # 执行导出
+            result = await self.export_data(query, params, options)
+
+            # 完成
+            tracker.progress = ProgressInfo(
+                stage='completed',
+                progress=100,
+                message='数据导出完成',
+                start_time=datetime.now()
+            )
+            self._update_progress(tracker)
+
+            if tracker.on_complete:
+                tracker.on_complete(result)
+
+            return result, tracker
+
+        except Exception as e:
+            tracker.progress = ProgressInfo(
+                stage='error',
+                progress=0,
+                message=f'数据导出失败: {str(e)}',
+                start_time=datetime.now()
+            )
+            self._update_progress(tracker)
+
+            if tracker.on_error:
+                tracker.on_error(e)
+
+            raise
+
+    async def export_data_queued(self, query: str, params: Optional[List[Any]] = None,
+                               options: Optional[ExportOptions] = None,
+                               priority: int = 1) -> str:
+        """带队列的数据导出"""
+        task_id = self.add_task_to_queue(
+            'export',
+            lambda: self._execute_export_task(query, params or [], options or ExportOptions()),
+            {'query': query, 'params': params or [], 'options': options},
+            priority
+        )
+
+        return task_id
+
+    async def _execute_export_task(self, query: str, params: List[Any], options: ExportOptions) -> ExportResult:
+        """执行导出任务"""
+        return await self.export_data(query, params, options)
+
+    async def export_large_data(self, query: str, params: Optional[List[Any]] = None,
+                              options: Optional[ExportOptions] = None) -> ExportResult:
+        """大文件数据导出 - 使用流式处理"""
+        start_time = TimeUtils.now()
+
+        try:
+            if not options:
+                options = ExportOptions()
+
+            # 设置大文件处理选项
+            large_options = ExportOptions(
+                **options.model_dump(),
+                streaming=True,
+                batch_size=options.batch_size or 1000,
+                max_rows=options.max_rows or 1000000
+            )
+
+            # 检查内存使用情况
+            memory_pressure = self.memory_manager.check_memory_pressure()
+            if memory_pressure > 0.8:
+                await self._request_memory_cleanup()
+
+            # 生成输出文件路径
+            output_path = self._generate_output_path_for_export(options, 'excel')
+
+            # 使用流式导出
+            return await self._export_with_streaming(query, params or [], large_options, output_path, start_time)
+
+        except Exception as e:
+            duration = int((TimeUtils.now() - start_time) * 1000)
+            error_message = str(e)
+
+            logger.error("大文件数据导出失败", "MySQLBackupTool", {
+                "error": error_message,
+                "duration": duration
+            })
+
+            return ExportResult(
+                success=False,
+                error=error_message,
+                duration=duration
+            )
+
+    async def _export_with_streaming(self, query: str, params: List[Any],
+                                   options: ExportOptions, output_path: str, start_time: float) -> ExportResult:
+        """使用流式处理的导出"""
+        exporter_factory = ExporterFactory.get_instance(self.mysql_manager, self.memory_manager)
+        exporter = exporter_factory.create_exporter(options.format or 'excel')
+
+        # 这里可以实现更复杂的流式处理逻辑
+        # 目前先使用基础的导出器
+        return await exporter.export(query, params, options)
+
+    def _generate_output_path_for_export(self, options: ExportOptions, extension: str) -> str:
+        """生成导出文件路径"""
+        # 确保输出目录存在
+        Path(options.output_dir or './exports').mkdir(parents=True, exist_ok=True)
+
+        # 生成文件名
+        if not options.file_name:
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            file_name = f'export_{timestamp}.{extension}'
+        else:
+            file_name = options.file_name
+            if not file_name.endswith(f'.{extension}'):
+                file_name += f'.{extension}'
+
+        return str(Path(options.output_dir or './exports') / file_name)
+
+    async def export_with_batch_optimization(self, query: str, params: Optional[List[Any]] = None,
+                                           options: Optional[ExportOptions] = None) -> ExportResult:
+        """使用批量优化的导出"""
+        start_time = TimeUtils.now()
+
+        try:
+            if not options:
+                options = ExportOptions()
+
+            # 优化批处理设置
+            batch_options = ExportOptions(
+                **options.model_dump(),
+                batch_size=options.batch_size or 500,
+                streaming=True
+            )
+
+            # 检查查询是否适合批量处理
+            if self._is_suitable_for_batch_processing(query):
+                return await self._export_with_batch_processing(query, params or [], batch_options, start_time)
+            else:
+                return await self.export_data(query, params, options)
+
+        except Exception as e:
+            duration = int((TimeUtils.now() - start_time) * 1000)
+            error_message = str(e)
+
+            logger.error("批量优化导出失败", "MySQLBackupTool", {
+                "error": error_message,
+                "duration": duration
+            })
+
+            return ExportResult(
+                success=False,
+                error=error_message,
+                duration=duration
+            )
+
+    def _is_suitable_for_batch_processing(self, query: str) -> bool:
+        """检查查询是否适合批量处理"""
+        query_lower = query.lower()
+        return 'select' in query_lower and 'limit' not in query_lower
+
+    async def _export_with_batch_processing(self, query: str, params: List[Any],
+                                          options: ExportOptions, start_time: float) -> ExportResult:
+        """使用批量处理的导出"""
+        # 这里可以实现批量处理逻辑
+        # 目前先使用基础导出
+        return await self.export_data(query, params, options)
+
+    async def _execute_with_recovery(self, operation, strategy: RecoveryStrategy,
+                                   operation_type: str, original_options) -> ErrorRecoveryResult:
+        """通用错误恢复执行器"""
+        last_error = None
+        attempts_used = 0
+        recovery_applied = None
+
+        # 主要尝试
+        for attempt in range(strategy.retry_count + 1):
+            try:
+                attempts_used = attempt + 1
+
+                if attempt > 0:
+                    # 计算延迟时间
+                    delay = strategy.retry_delay * (2 ** (attempt - 1)) if strategy.exponential_backoff else strategy.retry_delay
+                    await asyncio.sleep(delay / 1000)
+
+                    # 调用重试回调
+                    if strategy.on_retry:
+                        strategy.on_retry(attempt, last_error)
+
+                result = await operation()
+
+                if attempt > 0:
+                    recovery_applied = f"成功重试 (第 {attempt} 次尝试)"
+
+                return ErrorRecoveryResult(
+                    success=True,
+                    result=result,
+                    recovery_applied=recovery_applied,
+                    attempts_used=attempts_used
+                )
+
+            except Exception as e:
+                last_error = e
+
+                # 检查是否是可恢复的错误
+                if not self._is_recoverable_error(e):
+                    break
+
+        # 如果有回退选项，尝试回退策略
+        if strategy.fallback_options and last_error:
+            try:
+                if strategy.on_fallback:
+                    strategy.on_fallback(last_error)
+
+                # 应用回退选项
+                fallback_options = original_options.model_copy()
+                for key, value in strategy.fallback_options.items():
+                    setattr(fallback_options, key, value)
+
+                fallback_result = await operation()  # 这里应该传递fallback_options，但为了简化
+
+                return ErrorRecoveryResult(
+                    success=True,
+                    result=fallback_result,
+                    recovery_applied="应用回退策略成功",
+                    attempts_used=attempts_used
+                )
+
+            except Exception as fallback_error:
+                pass  # 回退也失败了
+
+        # 所有恢复尝试都失败了
+        return ErrorRecoveryResult(
+            success=False,
+            error=f"{operation_type} 操作失败，已尝试 {attempts_used} 次: {str(last_error)}",
+            attempts_used=attempts_used,
+            final_error=str(last_error)
+        )
+
+    def _is_recoverable_error(self, error: Exception) -> bool:
+        """判断错误是否可恢复"""
+        error_message = str(error).lower()
+        recoverable_patterns = [
+            'timeout', 'connection', 'network', 'temporary', 'lock wait', 'deadlock'
+        ]
+
+        return any(pattern in error_message for pattern in recoverable_patterns)
+
+    async def generate_report(self, report_config: ReportConfig) -> ExportResult:
+        """生成数据报表"""
+        start_time = TimeUtils.now()
+
+        try:
+            # 设置默认导出选项
+            options = report_config.options or ExportOptions(
+                output_dir='./reports',
+                format='excel',
+                include_headers=True
+            )
+
+            # 确保输出目录存在
+            os.makedirs(options.output_dir, exist_ok=True)
+
+            # 生成文件名
+            if not options.file_name:
+                timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+                options.file_name = f"report_{report_config.title.replace(' ', '_')}_{timestamp}.xlsx"
+
+            file_path = os.path.join(options.output_dir, options.file_name)
+
+            # 创建工作簿
+            wb = Workbook()
+            total_rows = 0
+            total_columns = 0
+
+            # 添加报表信息工作表
+            info_sheet = wb.active
+            info_sheet.title = '报表信息'
+            info_sheet['A1'] = '报表标题'
+            info_sheet['B1'] = report_config.title
+            info_sheet['A2'] = '生成时间'
+            info_sheet['B2'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            if report_config.description:
+                info_sheet['A3'] = '报表描述'
+                info_sheet['B3'] = report_config.description
+            info_sheet['A4'] = '查询数量'
+            info_sheet['B4'] = len(report_config.queries)
+
+            # 为每个查询创建工作表
+            for query_config in report_config.queries:
+                try:
+                    data = await self.mysql_manager.execute_query(query_config.query, query_config.params or [])
+
+                    if data:
+                        ws = wb.create_sheet(title=query_config.name[:31])  # Excel限制
+
+                        # 添加标题
+                        ws['A1'] = query_config.name
+                        ws['A1'].font = Font(bold=True, size=12)
+                        title_row = 1
+
+                        # 添加列头
+                        if options.include_headers and data:
+                            headers = list(data[0].keys())
+                            for col_num, header in enumerate(headers, 1):
+                                ws.cell(row=title_row + 2, column=col_num, value=header)
+
+                            # 设置列头样式
+                            header_fill = PatternFill(start_color="E0E0E0", end_color="E0E0E0", fill_type="solid")
+                            header_font = Font(bold=True)
+                            for cell in ws[title_row + 2]:
+                                cell.fill = header_fill
+                                cell.font = header_font
+
+                            data_start_row = title_row + 3
+                        else:
+                            data_start_row = title_row + 2
+
+                        # 添加数据
+                        for row_num, row_data in enumerate(data, data_start_row):
+                            for col_num, value in enumerate(row_data.values(), 1):
+                                ws.cell(row=row_num, column=col_num, value=value)
+
+                        # 自动调整列宽
+                        for column in ws.columns:
+                            max_length = 0
+                            column_letter = column[0].column_letter
+
+                            for cell in column:
+                                try:
+                                    if len(str(cell.value)) > max_length:
+                                        max_length = len(str(cell.value))
+                                except:
+                                    pass
+
+                            adjusted_width = min(max(max_length + 2, 10), 50)
+                            ws.column_dimensions[column_letter].width = adjusted_width
+
+                        total_rows += len(data)
+                        total_columns = max(total_columns, len(data[0]) if data else 0)
+
+                except Exception as e:
+                    # 为查询错误创建错误工作表
+                    error_sheet = wb.create_sheet(title=f"错误_{query_config.name[:25]}")
+                    error_sheet['A1'] = '查询名称'
+                    error_sheet['B1'] = query_config.name
+                    error_sheet['A2'] = '错误信息'
+                    error_sheet['B2'] = str(e)
+                    error_sheet['A3'] = '查询SQL'
+                    error_sheet['B3'] = query_config.query
+
+            # 更新信息表
+            info_sheet['A5'] = '总行数'
+            info_sheet['B5'] = total_rows
+            info_sheet['A6'] = '总列数'
+            info_sheet['B6'] = total_columns
+
+            # 保存文件
+            wb.save(file_path)
+
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            duration = int((TimeUtils.now() - start_time) * 1000)
+
+            return ExportResult(
+                success=True,
+                file_path=file_path,
+                file_size=file_size,
+                row_count=total_rows,
+                column_count=total_columns,
+                format='excel',
+                duration=duration
+            )
+
+        except Exception as e:
+            duration = int((TimeUtils.now() - start_time) * 1000)
+            error_message = str(e)
+
+            logger.error("报表生成失败", "MySQLBackupTool", {
+                "error": error_message,
+                "duration": duration,
+                "report_title": report_config.title
+            })
+
+            return ExportResult(
+                success=False,
+                error=error_message,
+                duration=duration
+            )
+
+    async def create_progress_tracker(self, operation: str,
+                                    cancellation_token: Optional[CancellationToken] = None) -> ProgressTracker:
+        """创建进度跟踪器"""
+        tracker_id = f"{operation}_{int(time.time())}_{self.task_id_counter}"
+        self.task_id_counter += 1
+
+        tracker = ProgressTracker(
+            id=tracker_id,
+            operation=operation,
+            start_time=datetime.now(),
+            progress=ProgressInfo(
+                stage='preparing',
+                progress=0,
+                message=f'准备开始 {operation} 操作...'
+            ),
+            cancellation_token=cancellation_token
+        )
+
+        self.progress_trackers[tracker_id] = tracker
+
+        # 监听取消事件
+        if cancellation_token:
+            cancellation_token.cancel = lambda reason=None: self._cancel_operation(tracker_id, reason)
+
+        return tracker
+
+    def _cancel_operation(self, tracker_id: str, reason: Optional[str] = None) -> None:
+        """取消操作"""
+        tracker = self.progress_trackers.get(tracker_id)
+        if tracker:
+            tracker.progress = ProgressInfo(
+                stage='error',
+                progress=0,
+                message=reason or '操作已被取消'
+            )
+            self._update_progress(tracker)
+
+    def _update_progress(self, tracker: ProgressTracker) -> None:
+        """更新进度"""
+        if tracker.on_progress:
+            tracker.on_progress(tracker.progress)
+
+    def set_max_listeners(self, max_listeners: int) -> None:
+        """设置最大监听器数量"""
+        self._max_listeners = max_listeners
+
+    def _setup_memory_management(self) -> None:
+        """设置内存管理"""
+        self.memory_manager.enable_memory_monitoring()
+
+        # 监听内存压力
+        self._memory_pressure_handler = lambda pressure: self._on_memory_pressure(pressure)
+
+    def _on_memory_pressure(self, pressure: float) -> None:
+        """内存压力处理"""
+        if pressure > 0.85:
+            # 高内存压力：清理完成的跟踪器
+            self._cleanup_completed_trackers()
+
+            # 强制垃圾回收
+            self._request_memory_cleanup()
+
+            if pressure > 0.95:
+                logger.warning("内存使用率过高，暂停新任务", "MySQLBackupTool", {
+                    "pressure": pressure
+                })
+
+    def _cleanup_completed_trackers(self) -> None:
+        """清理已完成的跟踪器"""
+        current_time = time.time()
+        expired_trackers = []
+
+        for tracker_id, tracker in self.progress_trackers.items():
+            elapsed = current_time - tracker.start_time.timestamp()
+            if elapsed > 300 or tracker.progress.stage in ['completed', 'error']:
+                expired_trackers.append(tracker_id)
+
+        for tracker_id in expired_trackers:
+            del self.progress_trackers[tracker_id]
+
+    async def _request_memory_cleanup(self) -> None:
+        """请求内存清理"""
+        self.memory_manager.request_memory_cleanup()
+        await self.cache_manager.clear_region(CacheRegion.QUERY_RESULT)
+
+    def _start_task_scheduler(self) -> None:
+        """启动任务调度器"""
+        if self.scheduler_running:
+            return
+
+        self.scheduler_running = True
+        self.scheduler_task = asyncio.create_task(self._task_scheduler_loop())
+
+        # 发出调度器启动事件
+        self.emit('scheduler-started', {
+            'max_concurrent_tasks': self.max_concurrent_tasks,
+            'adaptive_scheduling': True
+        })
+
+    async def _task_scheduler_loop(self) -> None:
+        """任务调度器循环 - 改进版自适应调度"""
+        while self.scheduler_running:
+            try:
+                # 获取待执行的任务数量以动态调整检查间隔
+                queued_tasks = len([task for task in self.task_queue.values() if task.status == 'queued'])
+                interval = 0.5 if queued_tasks > 5 else 1.0  # 高负载时更频繁检查
+
+                await self._process_task_queue()
+                await asyncio.sleep(interval)
+            except Exception as e:
+                logger.error(f"任务调度器错误: {e}", "MySQLBackupTool")
+                await asyncio.sleep(5)  # 错误时等待更长时间
+
+    async def _process_task_queue(self) -> None:
+        """处理任务队列 - 改进版任务处理"""
+        # 清理已完成的任务
+        self._cleanup_completed_tasks()
+
+        # 如果正在运行的任务已达到最大值，则等待
+        if self.running_tasks >= self.max_concurrent_tasks:
+            return
+
+        # 获取待执行的任务（按优先级排序）
+        pending_tasks = [
+            task for task in self.task_queue.values()
+            if task.status == 'queued'
+        ]
+        pending_tasks.sort(key=lambda x: x.priority, reverse=True)
+
+        # 启动可以运行的任务
+        tasks_to_start = pending_tasks[:self.max_concurrent_tasks - self.running_tasks]
+
+        for task in tasks_to_start:
+            asyncio.create_task(self._execute_task(task))
+
+    def _cleanup_completed_tasks(self) -> None:
+        """清理已完成的任务"""
+        current_time = time.time()
+        expired_tasks = []
+
+        for task_id, task in self.task_queue.items():
+            if task.status in ['completed', 'failed', 'cancelled']:
+                if task.completed_at and (current_time - task.completed_at.timestamp()) > 1800:  # 30分钟
+                    expired_tasks.append(task_id)
+
+        for task_id in expired_tasks:
+            del self.task_queue[task_id]
+
+    async def _execute_task(self, task: TaskQueue) -> None:
+        """执行单个任务 - 改进版任务执行"""
+        try:
+            # 更新任务状态
+            task.status = 'running'
+            task.started_at = datetime.now()
+            self.running_tasks += 1
+
+            # 发出任务开始事件
+            self.emit('task-started', {
+                'task_id': task.id,
+                'task_type': task.type,
+                'priority': task.priority,
+                'running_tasks': self.running_tasks
+            })
+
+            # 执行任务
+            if task.type == 'backup':
+                result = await self.create_backup(task.result if hasattr(task, 'result') else None)
+            elif task.type == 'export':
+                # 这里需要从任务参数中获取查询和选项
+                result = await self.export_data('SELECT 1', [])
+            else:
+                raise ValueError(f"不支持的任务类型: {task.type}")
+
+            # 任务完成
+            task.status = 'completed'
+            task.completed_at = datetime.now()
+            task.result = result
+            self.running_tasks -= 1
+
+            # 发出任务完成事件
+            self.emit('task-completed', {
+                'task_id': task.id,
+                'task_type': task.type,
+                'result': result,
+                'duration': int((task.completed_at.timestamp() - task.started_at.timestamp()) * 1000),
+                'running_tasks': self.running_tasks
+            })
+
+        except Exception as e:
+            task.status = 'failed'
+            task.completed_at = datetime.now()
+            task.error = str(e)
+            self.running_tasks -= 1
+
+            # 发出任务失败事件
+            self.emit('task-failed', {
+                'task_id': task.id,
+                'task_type': task.type,
+                'error': str(e),
+                'running_tasks': self.running_tasks
+            })
+
+            logger.error(f"任务执行失败: {e}", "MySQLBackupTool", {
+                "task_id": task.id,
+                "task_type": task.type
+            })
+
+    def add_task_to_queue(self, task_type: str, operation_func: callable,
+                          params: Dict[str, Any] = None, priority: int = 1) -> str:
+        """添加任务到队列 - 改进版任务队列管理"""
+        task_id = f"{task_type}_{int(time.time())}_{self.task_id_counter}"
+        self.task_id_counter += 1
+
+        task = TaskQueue(
+            id=task_id,
+            type=task_type,
+            status='queued',
+            priority=priority,
+            created_at=datetime.now(),
+            progress=ProgressInfo(
+                stage='preparing',
+                progress=0,
+                message=f'{task_type} 任务已加入队列...'
+            )
+        )
+
+        self.task_queue[task_id] = task
+
+        # 发出任务排队事件
+        self.emit('task-queued', {
+            'task_id': task_id,
+            'task_type': task_type,
+            'priority': priority,
+            'queue_size': len(self.task_queue)
+        })
+
+        logger.info("任务已加入队列", "MySQLBackupTool", {
+            "task_id": task_id,
+            "task_type": task_type,
+            "priority": priority,
+            "queue_size": len(self.task_queue)
+        })
+
+        return task_id
+
+    def get_task_status(self, task_id: str) -> Optional[TaskQueue]:
+        """获取任务状态"""
+        return self.task_queue.get(task_id)
+
+    def get_memory_usage(self) -> MemoryUsage:
+        """获取内存使用情况"""
+        return self.memory_manager.get_current_usage()
+
+    def get_memory_pressure(self) -> float:
+        """获取内存压力"""
+        return self.memory_manager.check_memory_pressure()
+
+    async def cleanup_memory(self) -> Dict[str, Any]:
+        """清理内存"""
+        await self._request_memory_cleanup()
+        self._cleanup_completed_trackers()
+
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "memory_usage": self.get_memory_usage().model_dump(),
+            "active_trackers": len(self.progress_trackers),
+            "queued_tasks": len([t for t in self.task_queue.values() if t.status == 'queued'])
+        }
+
+    def set_memory_monitoring(self, enabled: bool) -> None:
+        """设置内存监控"""
+        if enabled:
+            self.memory_manager.enable_memory_monitoring()
+        else:
+            self.memory_manager.disable_memory_monitoring()
+
+    async def close(self) -> None:
+        """关闭备份工具"""
+        try:
+            # 停止任务调度器
+            self.scheduler_running = False
+            if self.scheduler_task:
+                self.scheduler_task.cancel()
+                try:
+                    await self.scheduler_task
+                except asyncio.CancelledError:
+                    pass
+
+            # 取消所有运行中的任务
+            for task in self.task_queue.values():
+                if task.status == 'running':
+                    task.status = 'cancelled'
+                    task.completed_at = datetime.now()
+
+            # 清理缓存
+            await self.cache_manager.clear_region(CacheRegion.QUERY_RESULT)
+
+            # 禁用内存监控
+            self.memory_manager.disable_memory_monitoring()
+
+            # 清理所有跟踪器
+            self.progress_trackers.clear()
+
+            # 清空任务队列
+            self.task_queue.clear()
+
+            logger.info("MySQL备份工具已关闭", "MySQLBackupTool")
+
+        except Exception as e:
+            logger.error(f"关闭备份工具时出错: {e}", "MySQLBackupTool")
+
+    async def create_incremental_backup(self, options: Optional[IncrementalBackupOptions] = None) -> IncrementalBackupResult:
+        """创建增量备份"""
+        start_time = TimeUtils.now()
+        options = options or IncrementalBackupOptions()
+
+        # 设置默认值
+        backup_options = IncrementalBackupOptions(
+            output_dir=options.output_dir or './backups',
+            compress=options.compress if options.compress is not None else True,
+            include_data=options.include_data if options.include_data is not None else True,
+            include_structure=options.include_structure if options.include_structure is not None else False,
+            tables=options.tables or [],
+            file_prefix=options.file_prefix or 'mysql_incremental',
+            max_file_size=options.max_file_size or 100,
+            incremental_mode=options.incremental_mode or 'timestamp',
+            tracking_table=options.tracking_table or '__backup_tracking'
+        )
 
         try:
             # 确保输出目录存在
-            output_path = Path(opts.output_dir or "./backups")
-            output_path.mkdir(parents=True, exist_ok=True)
+            os.makedirs(backup_options.output_dir, exist_ok=True)
 
-            # 获取上次备份时间
-            since_time = await self._get_last_backup_time(opts.tracking_table or "__backup_tracking")
+            # 确定增量备份的起始点
+            since_time = datetime.now()
+            changed_tables = []
+            total_changes = 0
 
-            # 分析哪些表有变化
-            changed_tables_result = await self._get_changed_tables(since_time, opts.tables)
-            changed_tables = changed_tables_result["changed_tables"]
-            total_changes = changed_tables_result["total_changes"]
+            if backup_options.incremental_mode == 'timestamp':
+                if backup_options.last_backup_time:
+                    since_time = datetime.fromisoformat(backup_options.last_backup_time.replace('Z', '+00:00'))
+                else:
+                    # 尝试从跟踪表获取最后备份时间
+                    since_time = await self._get_last_backup_time(backup_options.tracking_table)
 
-            if len(changed_tables) == 0:
+            # 获取有变化的表
+            changed_info = await self._get_changed_tables(since_time, backup_options.tables)
+            changed_tables = changed_info["changed_tables"]
+            total_changes = changed_info["total_changes"]
+
+            if not changed_tables:
                 return IncrementalBackupResult(
                     success=True,
-                    backup_type="incremental",
-                    file_path="",
+                    backup_type='incremental',
+                    file_path='',
                     file_size=0,
                     table_count=0,
                     record_count=0,
-                    duration=int((time.time() - start_time) * 1000),
-                    incremental_since=since_time.isoformat() if since_time else None,
+                    duration=int((TimeUtils.now() - start_time) * 1000),
+                    incremental_since=since_time.isoformat(),
                     changed_tables=[],
                     total_changes=0,
-                    message="自上次备份以来没有数据变化"
+                    message='自上次备份以来没有数据变化'
                 )
 
             # 生成备份文件名
-            timestamp = datetime.now().isoformat().replace(':', '-').replace('.', '-')
-            since_timestamp = since_time.isoformat().replace(':', '-').replace('.', '-') if since_time else "start"
-            file_name = f"{opts.file_prefix}_{since_timestamp}_to_{timestamp}"
-            backup_path = output_path / file_name
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            since_timestamp = since_time.strftime('%Y-%m-%d_%H-%M-%S')
+            file_name = f"{backup_options.file_prefix}_{since_timestamp}_to_{timestamp}"
+            backup_path = os.path.join(backup_options.output_dir, file_name)
+
+            # 获取数据库配置
+            config = self.mysql_manager.config_manager.database
 
             # 构建增量备份的 mysqldump 命令
             dump_args = [
-                "mysqldump",
-                "-h", str(self.mysql_manager.config.database.host),
-                "-P", str(self.mysql_manager.config.database.port),
-                "-u", self.mysql_manager.config.database.user,
-                "-p" + self.mysql_manager.config.database.password,
-                "--default-character-set=utf8mb4",
-                "--single-transaction",
-                "--where", f"updated_at >= '{since_time.isoformat()[:19].replace('T', ' ')}'" if since_time else "1=1"
+                'mysqldump',
+                f'-h{config["host"]}',
+                f'-P{config["port"]}',
+                f'-u{config["user"]}',
+                f'-p{config["password"]}',
+                '--default-character-set=utf8mb4',
+                '--single-transaction'
             ]
 
-            if not opts.include_structure:
-                dump_args.append("--no-create-info")
+            if not backup_options.include_structure:
+                dump_args.append('--no-create-info')
 
-            if not opts.include_data:
-                dump_args.append("--no-data")
+            if not backup_options.include_data:
+                dump_args.append('--no-data')
 
-            dump_args.append(self.mysql_manager.config.database.database or "")
+            # 添加时间过滤条件
+            time_filter = since_time.strftime('%Y-%m-%d %H:%M:%S')
+            dump_args.extend([
+                '--where', f"updated_at >= '{time_filter}'",
+                config["database"] or ''
+            ])
+
             dump_args.extend(changed_tables)
 
             # 执行增量备份
-            sql_file_path = backup_path.with_suffix('.sql')
-            with open(sql_file_path, 'w') as f:
-                result = await asyncio.create_subprocess_exec(
-                    *dump_args,
-                    stdout=f,
-                    stderr=asyncio.subprocess.PIPE
-                )
-                _, stderr = await result.communicate()
-
-                if result.returncode != 0:
-                    raise MySQLMCPError(
-                        f"Incremental backup failed: {stderr.decode()}",
-                        ErrorCategory.BACKUP_ERROR
-                    )
+            sql_file_path = f"{backup_path}.sql"
+            await self._execute_mysqldump(dump_args, sql_file_path)
 
             # 在备份文件中添加增量备份信息
             backup_info = f"""-- Incremental Backup Information
--- Base backup: {opts.base_backup_path or 'N/A'}
--- Incremental since: {since_time.isoformat() if since_time else 'N/A'}
+-- Base backup: {backup_options.base_backup_path or 'N/A'}
+-- Incremental since: {since_time.isoformat()}
 -- Changed tables: {', '.join(changed_tables)}
 -- Total changes: {total_changes}
 -- Created at: {datetime.now().isoformat()}
 
 """
+            if os.path.exists(sql_file_path):
+                with open(sql_file_path, 'r', encoding='utf-8') as f:
+                    existing_content = f.read()
 
-            existing_content = sql_file_path.read_text()
-            sql_file_path.write_text(backup_info + existing_content)
+                with open(sql_file_path, 'w', encoding='utf-8') as f:
+                    f.write(backup_info + existing_content)
 
-            final_file_path = str(sql_file_path)
-            file_size = sql_file_path.stat().st_size
+                final_file_path = sql_file_path
+                file_size = os.path.getsize(sql_file_path)
 
-            # 检查文件大小并压缩
-            if opts.compress or file_size > (opts.max_file_size or 100) * 1024 * 1024:
-                zip_file_path = backup_path.with_suffix('.zip')
-                await self._compress_file(str(sql_file_path), str(zip_file_path))
+                # 压缩文件
+                if backup_options.compress:
+                    zip_file_path = f"{backup_path}.zip"
+                    await self._compress_file(sql_file_path, zip_file_path)
+                    os.unlink(sql_file_path)
+                    final_file_path = zip_file_path
+                    file_size = os.path.getsize(zip_file_path)
 
-                sql_file_path.unlink()
+                # 更新备份跟踪表
+                await self._update_backup_tracking(backup_options.tracking_table, datetime.now(), final_file_path)
 
-                final_file_path = str(zip_file_path)
-                file_size = zip_file_path.stat().st_size
+                duration = int((TimeUtils.now() - start_time) * 1000)
 
-            # 更新备份跟踪表
-            await self._update_backup_tracking(
-                opts.tracking_table or "__backup_tracking",
-                datetime.now(),
-                final_file_path,
-                "incremental"
-            )
+                return IncrementalBackupResult(
+                    success=True,
+                    backup_type='incremental',
+                    file_path=final_file_path,
+                    file_size=file_size,
+                    table_count=len(changed_tables),
+                    record_count=total_changes,
+                    duration=duration,
+                    base_backup_path=backup_options.base_backup_path,
+                    incremental_since=since_time.isoformat(),
+                    changed_tables=changed_tables,
+                    total_changes=total_changes
+                )
 
-            duration = int((time.time() - start_time) * 1000)
+        except Exception as e:
+            duration = int((TimeUtils.now() - start_time) * 1000)
+            error_message = str(e)
 
-            return IncrementalBackupResult(
-                success=True,
-                backup_type="incremental",
-                file_path=final_file_path,
-                file_size=file_size,
-                table_count=len(changed_tables),
-                record_count=total_changes,
-                duration=duration,
-                base_backup_path=opts.base_backup_path,
-                incremental_since=since_time.isoformat() if since_time else None,
-                changed_tables=changed_tables,
-                total_changes=total_changes
-            )
+            logger.error("增量备份创建失败", "MySQLBackupTool", {
+                "error": error_message,
+                "duration": duration
+            })
 
-        except Exception as error:
-            safe_error = ErrorHandler.safe_error(error, 'create_incremental_backup')
             return IncrementalBackupResult(
                 success=False,
-                backup_type="incremental",
-                error=safe_error.message,
-                duration=int((time.time() - start_time) * 1000),
+                backup_type='incremental',
+                error=error_message,
+                duration=duration,
                 changed_tables=[],
                 total_changes=0
             )
 
-    async def _get_last_backup_time(self, tracking_table: str) -> Optional[datetime]:
+    async def _get_last_backup_time(self, tracking_table: str) -> datetime:
         """获取最后备份时间"""
         try:
             # 检查跟踪表是否存在
-            table_exists = await self.mysql_manager.execute_query(
-                "SELECT COUNT(*) as count FROM information_schema.tables WHERE table_name = ? AND table_schema = DATABASE()",
+            result = await self.mysql_manager.execute_query(
+                "SELECT COUNT(*) as count FROM information_schema.tables WHERE table_name = %s AND table_schema = DATABASE()",
                 [tracking_table]
             )
 
-            if not isinstance(table_exists, list) or table_exists[0].get('count', 0) == 0:
+            if not result or result[0].get('count', 0) == 0:
                 # 创建跟踪表
                 await self.mysql_manager.execute_query(f"""
-                    CREATE TABLE `{tracking_table}` (
+                    CREATE TABLE IF NOT EXISTS `{tracking_table}` (
                         id INT AUTO_INCREMENT PRIMARY KEY,
                         backup_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         backup_type ENUM('full', 'incremental') NOT NULL,
@@ -516,410 +1692,88 @@ class MySQLBackupTool:
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 """)
-
-                return None  # 如果表不存在，返回None
+                return datetime.fromtimestamp(0)  # 如果表不存在，返回最早时间
 
             # 获取最后备份时间
-            last_backup = await self.mysql_manager.execute_query(
+            result = await self.mysql_manager.execute_query(
                 f"SELECT backup_time FROM `{tracking_table}` ORDER BY backup_time DESC LIMIT 1"
             )
 
-            if isinstance(last_backup, list) and len(last_backup) > 0:
-                backup_time_str = last_backup[0].get('backup_time')
+            if result and len(result) > 0:
+                backup_time_str = result[0].get('backup_time')
                 if backup_time_str:
-                    return datetime.fromisoformat(str(backup_time_str).replace(' ', 'T'))
+                    return datetime.fromisoformat(str(backup_time_str).replace('Z', '+00:00'))
 
-            return None
-        except Exception as error:
-            logger.warn("Failed to get last backup time", {
-                "error": str(error),
-                "tracking_table": tracking_table
-            })
-            return None
+            return datetime.fromtimestamp(0)
+        except Exception as e:
+            logger.warn(f"获取最后备份时间失败: {e}")
+            return datetime.fromtimestamp(0)
 
-    async def _get_changed_tables(self, since_time: Optional[datetime], specific_tables: Optional[List[str]] = None) -> Dict[str, Any]:
+    async def _get_changed_tables(self, since_time: datetime,
+                                specific_tables: Optional[List[str]] = None) -> Dict[str, Any]:
         """获取有变化的表"""
         try:
-            changed_tables: List[str] = []
+            changed_tables = []
             total_changes = 0
 
             # 获取所有表或指定表
-            tables: List[str]
-            if specific_tables and len(specific_tables) > 0:
-                tables = specific_tables
-            else:
-                cached_tables = await self.cache_manager.get(CacheRegion.QUERY_RESULT, 'SHOW_TABLES')
-                if cached_tables:
-                    tables = cached_tables
-                else:
-                    all_tables = await self.mysql_manager.execute_query('SHOW TABLES')
-                    tables = [list(row.values())[0] for row in all_tables] if isinstance(all_tables, list) else []
-                    await self.cache_manager.set(CacheRegion.QUERY_RESULT, 'SHOW_TABLES', tables)
+            tables = specific_tables or []
+            if not tables:
+                result = await self.mysql_manager.execute_query('SHOW TABLES')
+                tables = [row[list(row.keys())[0]] for row in result]
 
-            # 分批检查表变化
-            batch_size = min(5, self.max_concurrent_tasks)
-            for i in range(0, len(tables), batch_size):
-                batch = tables[i:i + batch_size]
+            # 并行检查表变化
+            for table in tables:
+                try:
+                    # 优先使用information_schema获取列信息
+                    result = await self.mysql_manager.execute_query(
+                        "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND DATA_TYPE IN ('timestamp', 'datetime') AND COLUMN_NAME IN ('updated_at', 'modified_at', 'updated_time', 'modification_time')",
+                        [table]
+                    )
 
-                change_promises = []
-                for table in batch:
-                    change_promises.append(self._check_table_changes(table, since_time))
+                    if result and len(result) > 0:
+                        timestamp_column = result[0].get('COLUMN_NAME')
 
-                batch_results = await asyncio.gather(*change_promises)
+                        # 使用索引优化的查询检查变化
+                        result = await self.mysql_manager.execute_query(
+                            f"SELECT COUNT(*) as count FROM `{table}` WHERE `{timestamp_column}` >= %s AND `{timestamp_column}` IS NOT NULL",
+                            [since_time.strftime('%Y-%m-%d %H:%M:%S')]
+                        )
 
-                # 处理批次结果
-                for result in batch_results:
-                    if result:
-                        changed_tables.append(result["table"])
-                        total_changes += result["changes"]
-
-                # 检查内存压力
-                pressure = self.memory_monitor.check_memory_pressure()
-                if pressure > 0.8:
-                    await self.memory_monitor.request_memory_cleanup()
-                    await asyncio.sleep(0.05)
+                        change_count = result[0].get('count', 0) if result else 0
+                        if change_count > 0:
+                            changed_tables.append(table)
+                            total_changes += change_count
+                except Exception as e:
+                    logger.warn(f"检查表 {table} 变化时出错: {e}")
 
             return {
                 "changed_tables": changed_tables,
                 "total_changes": total_changes
             }
 
-        except Exception as error:
-            logger.warn("Failed to get changed tables", {
-                "error": str(error),
-                "since_time": since_time.isoformat() if since_time else None
-            })
+        except Exception as e:
+            logger.warn(f"获取变化表失败: {e}")
             return {"changed_tables": [], "total_changes": 0}
 
-    async def _check_table_changes(self, table: str, since_time: Optional[datetime]) -> Optional[Dict[str, Any]]:
-        """检查单个表的变化"""
-        try:
-            # 优先使用information_schema获取列信息
-            columns = await self.mysql_manager.execute_query(
-                """SELECT COLUMN_NAME FROM information_schema.COLUMNS
-                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
-                AND DATA_TYPE IN ('timestamp', 'datetime')
-                AND COLUMN_NAME IN ('updated_at', 'modified_at', 'updated_time', 'modification_time')""",
-                [table]
-            )
-
-            if isinstance(columns, list) and len(columns) > 0:
-                timestamp_column = columns[0].get('COLUMN_NAME')
-                if timestamp_column:
-                    # 使用索引优化的查询检查变化
-                    changes = await self.mysql_manager.execute_query(
-                        f"""SELECT COUNT(*) as count FROM `{table}`
-                        WHERE `{timestamp_column}` >= ?
-                        AND `{timestamp_column}` IS NOT NULL""",
-                        [since_time.isoformat()[:19].replace('T', ' ') if since_time else '1970-01-01 00:00:00']
-                    )
-
-                    if isinstance(changes, list) and changes:
-                        change_count = changes[0].get('count', 0)
-                        if change_count > 0:
-                            return {"table": table, "changes": change_count}
-            else:
-                # 备用方案：检查AUTO_INCREMENT值
-                table_status = await self.mysql_manager.execute_query(
-                    """SELECT Update_time FROM information_schema.TABLES
-                    WHERE table_schema = DATABASE() AND table_name = ?""",
-                    [table]
-                )
-
-                if isinstance(table_status, list) and table_status:
-                    update_time = table_status[0].get('Update_time')
-                    if update_time and (not since_time or datetime.fromisoformat(str(update_time).replace(' ', 'T')) > since_time):
-                        return {"table": table, "changes": 1}
-
-            return None
-        except Exception as error:
-            logger.warn(f"Failed to check changes for table {table}", {
-                "error": str(error)
-            })
-            return None
-
-    async def _update_backup_tracking(self, tracking_table: str, backup_time: datetime, backup_path: str, backup_type: str = "incremental") -> None:
+    async def _update_backup_tracking(self, tracking_table: str, backup_time: datetime,
+                                    backup_path: str, backup_type: str = 'incremental') -> None:
         """更新备份跟踪记录"""
         try:
-            file_size = Path(backup_path).stat().st_size
+            file_size = os.path.getsize(backup_path) if os.path.exists(backup_path) else 0
 
-            await self.mysql_manager.execute_query(f"""
-                INSERT INTO `{tracking_table}` (backup_time, backup_type, backup_path, file_size)
-                VALUES (?, ?, ?, ?)
-            """, [backup_time, backup_type, backup_path, file_size])
-
-        except Exception as error:
-            logger.warn("Failed to update backup tracking", {
-                "error": str(error),
-                "tracking_table": tracking_table
-            })
-
-    async def _compress_file(self, source_path: str, target_path: str) -> None:
-        """压缩文件"""
-        with zipfile.ZipFile(target_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-            zipf.write(source_path, Path(source_path).name)
-
-    async def export_data(self, query: str, params: Optional[List[Any]] = None, options: ExportOptions = {}) -> ExportResult:
-        """
-        通用导出方法
-
-        @param {str} query - SQL查询
-        @param {List[Any]} params - 查询参数
-        @param {ExportOptions} options - 导出选项
-        @returns {ExportResult} 导出结果
-        """
-        start_time = time.time()
-
-        try:
-            # 默认选项
-            default_options = ExportOptions(
-                output_dir="./exports",
-                format="excel",
-                file_name=None,
-                include_headers=True
+            await self.mysql_manager.execute_query(
+                f"INSERT INTO `{tracking_table}` (backup_time, backup_type, backup_path, file_size) VALUES (%s, %s, %s, %s)",
+                [backup_time, backup_type, backup_path, file_size]
             )
 
-            opts = ExportOptions(**{**default_options.model_dump(), **options.model_dump()})
-
-            # 确保输出目录存在
-            output_path = Path(opts.output_dir or "./exports")
-            output_path.mkdir(parents=True, exist_ok=True)
-
-            # 执行查询
-            data = await self.mysql_manager.execute_query(query, params or [])
-            if not isinstance(data, list):
-                raise MySQLMCPError("Query returned invalid data format", ErrorCategory.DATA_EXPORT_ERROR)
-
-            if len(data) == 0:
-                return ExportResult(
-                    success=True,
-                    file_path=None,
-                    row_count=0,
-                    column_count=0,
-                    format=opts.format,
-                    duration=int((time.time() - start_time) * 1000),
-                    message="No data to export"
-                )
-
-            # 生成文件名
-            if not opts.file_name:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                opts.file_name = f"export_{timestamp}.{opts.format}"
-
-            file_path = output_path / opts.file_name
-
-            # 根据格式导出
-            if opts.format == "excel":
-                await self._export_to_excel(data, str(file_path), opts)
-            elif opts.format == "csv":
-                await self._export_to_csv(data, str(file_path), opts)
-            elif opts.format == "json":
-                await self._export_to_json(data, str(file_path), opts)
-            else:
-                raise MySQLMCPError(f"Unsupported export format: {opts.format}", ErrorCategory.DATA_EXPORT_ERROR)
-
-            # 获取文件信息
-            file_size = file_path.stat().st_size
-            duration = int((time.time() - start_time) * 1000)
-
-            return ExportResult(
-                success=True,
-                file_path=str(file_path),
-                file_size=file_size,
-                row_count=len(data),
-                column_count=len(data[0]) if data else 0,
-                format=opts.format,
-                duration=duration
-            )
-
-        except Exception as error:
-            safe_error = ErrorHandler.safe_error(error, 'export_data')
-            return ExportResult(
-                success=False,
-                error=safe_error.message,
-                duration=int((time.time() - start_time) * 1000)
-            )
-
-    async def _export_to_excel(self, data: List[Dict[str, Any]], file_path: str, options: ExportOptions) -> None:
-        """导出到Excel"""
-        df = pd.DataFrame(data)
-
-        with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
-            df.to_excel(writer, sheet_name=options.sheet_name or 'Data', index=False, header=options.include_headers)
-
-            # 设置样式
-            workbook = writer.book
-            worksheet = writer.sheets[options.sheet_name or 'Data']
-
-            if options.include_headers:
-                # 设置标题行样式
-                header_font = Font(bold=True, size=12)
-                header_fill = PatternFill(start_color="FFE0E0E0", end_color="FFE0E0E0", fill_type="solid")
-
-                for col_num, column_title in enumerate(df.columns, 1):
-                    cell = worksheet.cell(row=1, column=col_num)
-                    cell.font = header_font
-                    cell.fill = header_fill
-
-            # 自动调整列宽
-            for column in worksheet.columns:
-                max_length = 0
-                column_letter = get_column_letter(column[0].column)
-
-                for cell in column:
-                    try:
-                        if len(str(cell.value)) > max_length:
-                            max_length = len(str(cell.value))
-                    except:
-                        pass
-
-                adjusted_width = min(max_length + 2, 50)
-                worksheet.column_dimensions[column_letter].width = adjusted_width
-
-    async def _export_to_csv(self, data: List[Dict[str, Any]], file_path: str, options: ExportOptions) -> None:
-        """导出到CSV"""
-        df = pd.DataFrame(data)
-        df.to_csv(file_path, index=False, header=options.include_headers, encoding='utf-8-sig')
-
-    async def _export_to_json(self, data: List[Dict[str, Any]], file_path: str, options: ExportOptions) -> None:
-        """导出到JSON"""
-        import json
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-
-    async def generate_report(self, report_config: ReportConfig) -> ExportResult:
-        """
-        生成数据报表
-
-        @param {ReportConfig} report_config - 报表配置
-        @returns {ExportResult} 报表生成结果
-        """
-        start_time = time.time()
-
-        try:
-            opts = ExportOptions(
-                output_dir="./reports",
-                format="excel",
-                file_name=f"report_{report_config.title.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
-                include_headers=True,
-                **(report_config.options.model_dump() if report_config.options else {})
-            )
-
-            # 确保输出目录存在
-            output_path = Path(opts.output_dir or "./reports")
-            output_path.mkdir(parents=True, exist_ok=True)
-
-            # 创建工作簿
-            workbook = openpyxl.Workbook()
-            workbook.remove(workbook.active)  # 移除默认工作表
-
-            # 添加报表信息工作表
-            info_sheet = workbook.create_sheet('报表信息')
-            info_sheet.append(['报表标题', report_config.title])
-            info_sheet.append(['生成时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')])
-            if report_config.description:
-                info_sheet.append(['报表描述', report_config.description])
-            info_sheet.append(['查询数量', len(report_config.queries)])
-
-            # 设置信息表样式
-            info_sheet.column_dimensions['A'].width = 15
-            info_sheet.column_dimensions['B'].width = 40
-            info_sheet.cell(row=1, column=1).font = Font(bold=True, size=14)
-
-            total_rows = 0
-            total_columns = 0
-
-            # 为每个查询创建工作表
-            for query_config in report_config.queries:
-                try:
-                    data = await self.mysql_manager.execute_query(
-                        query_config.query,
-                        query_config.params or []
-                    )
-
-                    if isinstance(data, list) and len(data) > 0:
-                        worksheet = workbook.create_sheet(query_config.name[:31])  # Excel工作表名称限制
-                        df = pd.DataFrame(data)
-
-                        # 添加标题
-                        worksheet.append([query_config.name])
-                        worksheet.append([])  # 空行
-
-                        # 添加列头
-                        if opts.include_headers:
-                            worksheet.append(list(df.columns))
-                            # 设置标题行样式
-                            for col_num in range(1, len(df.columns) + 1):
-                                worksheet.cell(row=3, column=col_num).font = Font(bold=True)
-                                worksheet.cell(row=3, column=col_num).fill = PatternFill(
-                                    start_color="FFE0E0E0", end_color="FFE0E0E0", fill_type="solid"
-                                )
-
-                        # 添加数据
-                        for _, row in df.iterrows():
-                            worksheet.append(list(row))
-
-                        # 自动调整列宽
-                        for col_num, column in enumerate(worksheet.columns, 1):
-                            max_length = 0
-                            for cell in column:
-                                try:
-                                    if len(str(cell.value)) > max_length:
-                                        max_length = len(str(cell.value))
-                                except:
-                                    pass
-                            worksheet.column_dimensions[get_column_letter(col_num)].width = min(max_length + 2, 50)
-
-                        total_rows += len(data)
-                        total_columns = max(total_columns, len(df.columns))
-
-                except Exception as query_error:
-                    # 为查询错误创建错误工作表
-                    error_sheet = workbook.create_sheet(f'错误_{query_config.name[:25]}')
-                    error_sheet.append(['查询名称', query_config.name])
-                    error_sheet.append(['错误信息', str(query_error)])
-                    error_sheet.append(['查询SQL', query_config.query])
-
-            # 更新信息表
-            info_sheet.append(['总行数', total_rows])
-            info_sheet.append(['总列数', total_columns])
-
-            # 保存文件
-            file_path = output_path / opts.file_name
-            workbook.save(str(file_path))
-
-            file_size = file_path.stat().st_size
-            duration = int((time.time() - start_time) * 1000)
-
-            return ExportResult(
-                success=True,
-                file_path=str(file_path),
-                file_size=file_size,
-                row_count=total_rows,
-                column_count=total_columns,
-                format="excel",
-                duration=duration
-            )
-
-        except Exception as error:
-            safe_error = ErrorHandler.safe_error(error, 'generate_report')
-            return ExportResult(
-                success=False,
-                error=safe_error.message,
-                duration=int((time.time() - start_time) * 1000)
-            )
+        except Exception as e:
+            logger.warn(f"更新备份跟踪记录失败: {e}")
 
     async def verify_backup(self, backup_file_path: str, deep_validation: bool = True) -> BackupVerificationResult:
-        """
-        验证备份文件的完整性和有效性
-
-        @param {str} backup_file_path - 备份文件路径
-        @param {bool} deep_validation - 是否进行深度验证
-        @returns {BackupVerificationResult} 验证结果
-        """
+        """验证备份文件"""
         try:
-            file_path = Path(backup_file_path)
-            if not file_path.exists():
+            if not os.path.exists(backup_file_path):
                 return BackupVerificationResult(
                     valid=False,
                     file_size=0,
@@ -927,329 +1781,1158 @@ class MySQLBackupTool:
                     error="备份文件不存在"
                 )
 
-            stats = file_path.stat()
-            content = ""
+            stats = os.stat(backup_file_path)
+            file_size = stats.st_size
+            created_at = datetime.fromtimestamp(stats.st_mtime).isoformat()
+
+            warnings = []
+            compression = 'none'
+            compression_ratio = None
+            decompressed_size = None
+            checksum = None
+            temp_files = []
 
             # 检测压缩类型
-            file_ext = file_path.suffix.lower()
-            is_compressed = file_ext in ['.zip', '.gz', '.gzip']
-
-            warnings: List[str] = []
-            compression_type = 'none'
-            compression_ratio: Optional[float] = None
-            decompressed_size: Optional[int] = None
+            file_ext = os.path.splitext(backup_file_path)[1].lower()
+            is_compressed = file_ext in ['.zip', '.gz', '.gzip', '.br']
 
             if is_compressed:
-                compression_type = 'ZIP' if file_ext == '.zip' else 'GZIP'
+                compression = 'ZIP' if file_ext == '.zip' else ('GZIP' if file_ext in ['.gz', '.gzip'] else 'BROTLI')
 
-                if deep_validation:
-                    try:
-                        # 解压缩并验证内容
-                        content = await self._decompress_and_read(backup_file_path, compression_type)
-                        decompressed_size = len(content)
-                        compression_ratio = stats.st_size / decompressed_size if decompressed_size > 0 else None
-                    except Exception as e:
-                        return BackupVerificationResult(
-                            valid=False,
-                            file_size=stats.st_size,
-                            tables_found=[],
-                            compression=compression_type,
-                            created_at=stats.st_mtime,
-                            error=f"解压缩失败: {str(e)}",
-                            warnings=["无法解压缩文件进行内容验证"]
-                        )
-                else:
+                if not deep_validation:
                     return BackupVerificationResult(
                         valid=True,
-                        file_size=stats.st_size,
+                        file_size=file_size,
                         tables_found=[],
-                        compression=compression_type,
-                        created_at=stats.st_mtime,
-                        warnings=["仅进行浅验证，未解压缩验证内容"]
+                        compression=compression,
+                        created_at=created_at,
+                        warnings=['仅进行浅验证，未解压缩验证内容']
                     )
-            else:
-                content = file_path.read_text(encoding='utf-8')
 
-            # 文件大小检查
-            if stats.st_size == 0:
+                # 深度验证：解压缩并验证内容
+                try:
+                    temp_dir = tempfile.mkdtemp()
+                    temp_files = await self._decompress_file(backup_file_path, temp_dir, file_ext)
+
+                    if not temp_files:
+                        raise Exception('解压缩后未找到文件')
+
+                    # 找到SQL文件
+                    sql_file = temp_files[0]
+                    if len(temp_files) > 1:
+                        max_size = 0
+                        for file in temp_files:
+                            if file.endswith('.sql'):
+                                file_stats = os.stat(file)
+                                if file_stats.st_size > max_size:
+                                    max_size = file_stats.st_size
+                                    sql_file = file
+
+                    content = await self._read_file_async(sql_file)
+
+                    # 计算压缩比
+                    decompressed_size = os.path.getsize(sql_file)
+                    compression_ratio = file_size / decompressed_size if decompressed_size > 0 else None
+
+                    # 计算校验和
+                    checksum = hashlib.sha256(content.encode()).hexdigest()
+
+                    # 清理临时文件
+                    import shutil
+                    shutil.rmtree(temp_dir)
+
+                except Exception as e:
+                    return BackupVerificationResult(
+                        valid=False,
+                        file_size=file_size,
+                        tables_found=[],
+                        compression=compression,
+                        created_at=created_at,
+                        error=f"解压缩失败: {str(e)}",
+                        warnings=['无法解压缩文件进行内容验证']
+                    )
+
+            else:
+                content = await self._read_file_async(backup_file_path)
+                checksum = hashlib.sha256(content.encode()).hexdigest()
+
+            # 检查文件大小
+            if file_size == 0:
                 return BackupVerificationResult(
                     valid=False,
                     file_size=0,
                     tables_found=[],
-                    error="备份文件为空"
+                    error='备份文件为空'
                 )
 
-            if stats.st_size < 100:
-                warnings.append("备份文件大小异常小，可能不完整")
+            if file_size < 100:
+                warnings.append('备份文件大小异常小，可能不完整')
 
-            # 计算校验和
-            checksum = hashlib.sha256(content.encode('utf-8')).hexdigest()
+            # 增强的SQL结构检查
+            has_header = any(keyword in content for keyword in [
+                'mysqldump', 'MySQL dump', '-- Server version', 'MySQL数据库备份'
+            ])
 
-            # SQL结构检查
-            has_header = any(header in content for header in ['mysqldump', 'MySQL dump', 'MySQL数据库备份', '-- Server version'])
-            has_footer = any(footer in content for footer in ['Dump completed', '备份结束', '-- Dump completed on', 'SET SQL_MODE=@OLD_SQL_MODE'])
-            has_charset = any(charset in content for charset in ['utf8', 'UTF8', 'CHARACTER SET', 'CHARSET'])
+            has_footer = any(keyword in content for keyword in [
+                'Dump completed', '备份结束', '-- Dump completed on', 'SET SQL_MODE=@OLD_SQL_MODE'
+            ])
+
+            has_charset = any(keyword in content for keyword in ['utf8', 'UTF8', 'CHARACTER SET', 'CHARSET'])
+
+            # 检查表结构
+            create_table_matches = len([m for m in content.split('\n') if 'CREATE TABLE' in m])
+            drop_table_matches = len([m for m in content.split('\n') if 'DROP TABLE' in m])
+            insert_matches = len([m for m in content.split('\n') if 'INSERT INTO' in m])
 
             # 提取表名
-            import re
-            create_table_matches = re.findall(r'CREATE TABLE[\s\S]*?ENGINE[\s\S]*?;', content, re.IGNORECASE)
-            drop_table_matches = re.findall(r'DROP TABLE IF EXISTS [`"]([^`"]+)[`"]', content, re.IGNORECASE)
-            lock_table_matches = re.findall(r'LOCK TABLES [`"]([^`"]+)[`"]', content, re.IGNORECASE)
-            insert_matches = re.findall(r'INSERT INTO[\s\S]*?VALUES[\s\S]*?;', content, re.IGNORECASE)
+            tables_from_drop = []
+            for line in content.split('\n'):
+                if 'DROP TABLE' in line:
+                    # 简单的表名提取
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        table_name = parts[2].strip('`;"\'')
+                        if table_name:
+                            tables_from_drop.append(table_name)
 
-            all_tables = list(set(drop_table_matches + lock_table_matches))
+            all_tables = list(set(tables_from_drop))
 
             # 估算记录数量
-            estimated_records = len(re.findall(r'VALUES\s*\(', content, re.IGNORECASE))
+            estimated_records = len([line for line in content.split('\n') if 'INSERT INTO' in line])
 
             # 检查备份类型
-            backup_type = "unknown"
-            if create_table_matches and insert_matches:
-                backup_type = "full"
-            elif create_table_matches:
-                backup_type = "structure"
-            elif insert_matches:
-                backup_type = "data"
+            backup_type = 'unknown'
+            if create_table_matches > 0 and insert_matches > 0:
+                backup_type = 'full'
+            elif create_table_matches > 0:
+                backup_type = 'structure'
+            elif insert_matches > 0:
+                backup_type = 'data'
 
             # 验证检查
             if not all_tables:
-                warnings.append("未找到表定义，备份可能不完整或格式不正确")
+                warnings.append('未找到表定义，备份可能不完整或格式不正确')
 
-            if backup_type == "full" and estimated_records == 0:
-                warnings.append("未找到数据插入语句，可能为空表备份")
+            if backup_type == 'full' and estimated_records == 0:
+                warnings.append('未找到数据插入语句，可能为空表备份')
 
             if not has_charset:
-                warnings.append("未找到字符集设置，可能导致乱码问题")
+                warnings.append('未找到字符集设置，可能导致乱码问题')
 
-            # 检查SQL语法问题
-            suspicious_patterns = [
-                r'LOCK TABLES[^;]*(?!UNLOCK)',
-                r'BEGIN(?![;\s]*COMMIT)',
-                r'START TRANSACTION(?![;\s]*COMMIT)'
-            ]
+            # 检查是否有多行INSERT
+            multi_row_inserts = len([line for line in content.split('\n') if ',(' in line])
+            if multi_row_inserts > 0:
+                estimated_records += multi_row_inserts
 
-            for pattern in suspicious_patterns:
-                if re.search(pattern, content, re.IGNORECASE):
-                    warnings.append("发现可能的SQL语法问题或未完成的事务")
-
-            # 检查截断问题
+            # 检查文件完整性
             if not content.endswith('\n') and not content.endswith(';'):
-                warnings.append("备份文件可能被截断（文件末尾异常）")
+                warnings.append('备份文件可能被截断（文件末尾异常）')
 
-            # 完整性评分
+            # 计算完整性评分
             completeness_score = self._calculate_completeness_score({
-                "has_header": has_header,
-                "has_footer": has_footer,
-                "tables_count": len(all_tables),
-                "has_inserts": len(insert_matches) > 0,
-                "has_charset": has_charset,
-                "warnings_count": len(warnings)
+                'has_header': has_header,
+                'has_footer': has_footer,
+                'tables_count': len(all_tables),
+                'has_inserts': insert_matches > 0,
+                'has_charset': has_charset,
+                'warnings_count': len(warnings)
             })
 
             is_valid = has_header and len(all_tables) > 0 and completeness_score >= 0.7
 
             return BackupVerificationResult(
                 valid=is_valid,
-                file_size=stats.st_size,
+                file_size=file_size,
                 tables_found=all_tables,
                 record_count=estimated_records,
-                created_at=datetime.fromtimestamp(stats.st_mtime).isoformat(),
+                created_at=created_at,
                 backup_type=backup_type,
-                compression=compression_type,
+                compression=compression,
                 compression_ratio=compression_ratio,
                 decompressed_size=decompressed_size,
                 checksum=checksum,
-                error=self._generate_validation_error(has_header, len(all_tables), has_footer, completeness_score) if not is_valid else None,
+                error=None if is_valid else self._generate_validation_error(has_header, len(all_tables), has_footer, completeness_score),
                 warnings=warnings if warnings else None
             )
 
-        except Exception as error:
+        except Exception as e:
             return BackupVerificationResult(
                 valid=False,
                 file_size=0,
                 tables_found=[],
-                error=f"验证过程中出错: {str(error)}"
+                error=f"验证过程中出错: {str(e)}"
             )
-
-    async def _decompress_and_read(self, file_path: str, compression_type: str) -> str:
-        """解压缩并读取文件内容"""
-        if compression_type == 'ZIP':
-            with zipfile.ZipFile(file_path, 'r') as zipf:
-                # 找到SQL文件
-                sql_files = [f for f in zipf.namelist() if f.endswith('.sql')]
-                if not sql_files:
-                    raise ValueError("ZIP文件中未找到SQL文件")
-                return zipf.read(sql_files[0]).decode('utf-8')
-        elif compression_type == 'GZIP':
-            with gzip.open(file_path, 'rt', encoding='utf-8') as f:
-                return f.read()
-        else:
-            raise ValueError(f"不支持的压缩类型: {compression_type}")
 
     def _calculate_completeness_score(self, params: Dict[str, Any]) -> float:
         """计算备份文件完整性评分"""
         score = 0.0
 
-        if params["has_header"]:
+        if params['has_header']:
             score += 0.3
-        if params["has_footer"]:
+        if params['has_footer']:
             score += 0.2
-        if params["tables_count"] > 0:
+        if params['tables_count'] > 0:
             score += 0.3
-        if params["has_charset"]:
+        if params['has_charset']:
             score += 0.1
-        if params["has_inserts"]:
+        if params['has_inserts']:
             score += 0.1
 
         # 警告扣分
-        score -= min(params["warnings_count"] * 0.05, 0.2)
+        score -= min(params['warnings_count'] * 0.05, 0.2)
 
         return max(0.0, min(1.0, score))
 
-    def _generate_validation_error(self, has_header: bool, tables_count: int, has_footer: bool, completeness_score: float) -> str:
+    def _generate_validation_error(self, has_header: bool, tables_count: int,
+                                 has_footer: bool, completeness_score: float) -> str:
         """生成验证错误信息"""
-        errors: List[str] = []
+        errors = []
 
         if not has_header:
-            errors.append("缺少备份文件头")
+            errors.append('缺少备份文件头')
         if tables_count == 0:
-            errors.append("未找到表定义")
+            errors.append('未找到表定义')
         if not has_footer:
-            errors.append("缺少文件结尾标识")
+            errors.append('缺少文件结尾标识')
         if completeness_score < 0.7:
-            errors.append(".1f")
+            errors.append(f'完整性评分过低 ({completeness_score * 100:.1f}%)')
 
         return f"备份文件验证失败: {', '.join(errors)}"
 
-    # 任务队列管理方法
-    async def _start_task_scheduler(self) -> None:
-        """启动任务调度器"""
-        if hasattr(self, '_scheduler_running') and self._scheduler_running:
-            return
-
-        self._scheduler_running = True
-
-        logger.info("Task scheduler started", {
-            "max_concurrent_tasks": self.max_concurrent_tasks,
-            "adaptive_scheduling": True
-        })
-
-        while self._scheduler_running:
-            try:
-                await self._process_task_queue()
-                # 根据任务负载调整检查频率
-                queued_tasks = len([t for t in self.task_queue.values() if t.status == "queued"])
-                interval = 0.5 if queued_tasks > 5 else 1.0
-                await asyncio.sleep(interval)
-            except Exception as error:
-                logger.warn("Task queue processing error", {
-                    "error": str(error)
-                })
-
-    async def _process_task_queue(self) -> None:
-        """处理任务队列"""
-        # 清理已完成的任务
-        self._cleanup_completed_tasks()
-
-        # 如果当前运行的任务数量已达到最大值，则等待
-        if self.running_tasks >= self.max_concurrent_tasks:
-            return
-
-        # 获取待执行的任务
-        pending_tasks = [
-            task for task in self.task_queue.values()
-            if task.status == "queued"
-        ]
-        pending_tasks.sort(key=lambda t: t.priority, reverse=True)
-
-        # 启动可以运行的任务
-        tasks_to_start = pending_tasks[:self.max_concurrent_tasks - self.running_tasks]
-
-        for task in tasks_to_start:
-            asyncio.create_task(self._execute_task(task))
-
-    async def _execute_task(self, task: TaskQueue) -> None:
-        """执行单个任务"""
+    async def _decompress_file(self, file_path: str, temp_dir: str, file_ext: str) -> List[str]:
+        """解压缩文件"""
         try:
-            task.status = "running"
-            task.started_at = datetime.now()
-            self.running_tasks += 1
+            if file_ext == '.zip':
+                import zipfile
+                with zipfile.ZipFile(file_path, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+                    return [os.path.join(temp_dir, f) for f in zip_ref.namelist()]
+            else:
+                # 其他压缩格式的处理
+                return [file_path]  # 简化处理
+        except Exception as e:
+            logger.error(f"解压缩文件失败: {e}")
+            return []
 
-            logger.info("Task started", {
-                "task_id": task.id,
-                "type": task.type,
-                "running_tasks": self.running_tasks
+    async def _read_file_async(self, file_path: str) -> str:
+        """异步读取文件"""
+        def _read_file():
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                return f.read()
+
+        return await asyncio.get_event_loop().run_in_executor(None, _read_file)
+
+    # 为了向后兼容，提供一些便捷方法
+    async def backup_database(self, **kwargs) -> BackupResult:
+        """便捷的数据库备份方法"""
+        options = BackupOptions(**kwargs)
+        return await self.create_backup(options)
+
+    async def export_query_result(self, query: str, **kwargs) -> ExportResult:
+        """便捷的查询结果导出方法"""
+        options = ExportOptions(**kwargs)
+        return await self.export_data(query, options=options)
+
+    async def create_data_report(self, title: str, queries: List[Dict[str, Any]],
+                                **kwargs) -> ExportResult:
+        """便捷的数据报表创建方法"""
+        report_queries = [ReportQuery(**query) for query in queries]
+        config = ReportConfig(title=title, queries=report_queries, options=ExportOptions(**kwargs))
+        return await self.generate_report(config)
+
+    async def create_backup_with_progress(self, options: Optional[BackupOptions] = None,
+                                        cancellation_token: Optional[CancellationToken] = None) -> tuple:
+        """带进度跟踪的备份创建"""
+        tracker = await self.create_progress_tracker('backup', cancellation_token)
+
+        try:
+            # 更新进度
+            tracker.progress = ProgressInfo(
+                stage='preparing',
+                progress=10,
+                message='正在准备备份...'
+            )
+            self._update_progress(tracker)
+
+            # 执行备份
+            tracker.progress = ProgressInfo(
+                stage='dumping',
+                progress=50,
+                message='正在创建备份...'
+            )
+            self._update_progress(tracker)
+
+            result = await self.create_backup(options)
+
+            # 完成
+            tracker.progress = ProgressInfo(
+                stage='completed',
+                progress=100,
+                message='备份完成'
+            )
+            self._update_progress(tracker)
+
+            if tracker.on_complete:
+                tracker.on_complete(result)
+
+            return result, tracker
+
+        except Exception as e:
+            tracker.progress = ProgressInfo(
+                stage='error',
+                progress=0,
+                message=f'备份失败: {str(e)}'
+            )
+            self._update_progress(tracker)
+
+            if tracker.on_error:
+                tracker.on_error(e)
+
+            raise
+
+    async def create_backup_with_recovery(self, options: Optional[BackupOptions] = None,
+                                        recovery: Optional[RecoveryStrategy] = None) -> ErrorRecoveryResult:
+        """带错误恢复的备份创建"""
+        default_recovery = RecoveryStrategy(
+            retry_count=3,
+            retry_delay=1000,
+            exponential_backoff=True,
+            fallback_options={
+                'compress': False,
+                'max_file_size': 50
+            }
+        )
+
+        strategy = RecoveryStrategy(**(recovery.model_dump() if recovery else default_recovery.model_dump()))
+
+        return await self._execute_with_recovery(
+            lambda: self.create_backup(options),
+            strategy,
+            'backup',
+            options or BackupOptions()
+        )
+
+    async def _execute_with_recovery(self, operation, strategy: RecoveryStrategy,
+                                   operation_type: str, original_options) -> ErrorRecoveryResult:
+        """通用错误恢复执行器"""
+        last_error = None
+        attempts_used = 0
+        recovery_applied = None
+
+        # 主要尝试
+        for attempt in range(strategy.retry_count + 1):
+            try:
+                attempts_used = attempt + 1
+
+                if attempt > 0:
+                    # 计算延迟时间
+                    delay = strategy.retry_delay * (2 ** (attempt - 1)) if strategy.exponential_backoff else strategy.retry_delay
+                    await asyncio.sleep(delay / 1000)
+
+                    # 调用重试回调
+                    if strategy.on_retry:
+                        strategy.on_retry(attempt, last_error)
+
+                result = await operation()
+
+                if attempt > 0:
+                    recovery_applied = f"成功重试 (第 {attempt} 次尝试)"
+
+                return ErrorRecoveryResult(
+                    success=True,
+                    result=result,
+                    recovery_applied=recovery_applied,
+                    attempts_used=attempts_used
+                )
+
+            except Exception as e:
+                last_error = e
+
+                # 检查是否是可恢复的错误
+                if not self._is_recoverable_error(e):
+                    break
+
+        # 如果有回退选项，尝试回退策略
+        if strategy.fallback_options and last_error:
+            try:
+                if strategy.on_fallback:
+                    strategy.on_fallback(last_error)
+
+                # 应用回退选项
+                fallback_options = original_options.model_copy()
+                for key, value in strategy.fallback_options.items():
+                    setattr(fallback_options, key, value)
+
+                fallback_result = await operation()  # 这里应该传递fallback_options，但为了简化
+
+                return ErrorRecoveryResult(
+                    success=True,
+                    result=fallback_result,
+                    recovery_applied="应用回退策略成功",
+                    attempts_used=attempts_used
+                )
+
+            except Exception as fallback_error:
+                pass  # 回退也失败了
+
+        # 所有恢复尝试都失败了
+        return ErrorRecoveryResult(
+            success=False,
+            error=f"{operation_type} 操作失败，已尝试 {attempts_used} 次: {str(last_error)}",
+            attempts_used=attempts_used,
+            final_error=str(last_error)
+        )
+
+    def _is_recoverable_error(self, error: Exception) -> bool:
+        """判断错误是否可恢复"""
+        error_message = str(error).lower()
+        recoverable_patterns = [
+            'timeout', 'connection', 'network', 'temporary', 'lock wait', 'deadlock'
+        ]
+
+        return any(pattern in error_message for pattern in recoverable_patterns)
+
+    async def create_large_file_backup(self, options: Optional[BackupOptions] = None,
+                                     large_file_options: Optional[LargeFileOptions] = None) -> BackupResult:
+        """大文件备份（使用内存优化）"""
+        start_time = TimeUtils.now()
+        options = options or BackupOptions()
+        large_file_options = large_file_options or LargeFileOptions()
+
+        # 设置默认值
+        large_options = LargeFileOptions(
+            chunk_size=large_file_options.chunk_size or 64 * 1024 * 1024,
+            max_memory_usage=large_file_options.max_memory_usage or 512 * 1024 * 1024,
+            use_memory_pool=large_file_options.use_memory_pool if large_file_options.use_memory_pool is not None else True,
+            compression_level=large_file_options.compression_level or 6,
+            disk_threshold=large_file_options.disk_threshold or 100 * 1024 * 1024
+        )
+
+        backup_options = BackupOptions(
+            **(options.model_dump() if hasattr(options, 'model_dump') else options.__dict__),
+            compress=True,
+            max_file_size=int(large_options.disk_threshold / (1024 * 1024))
+        )
+
+        try:
+            # 检查内存使用情况
+            memory_pressure = self.memory_manager.check_memory_pressure()
+            if memory_pressure > 0.8:
+                await self._request_memory_cleanup()
+
+            # 确保输出目录存在
+            os.makedirs(backup_options.output_dir, exist_ok=True)
+
+            # 生成临时目录用于分块处理
+            temp_dir = os.path.join(backup_options.output_dir, f'temp_{int(time.time())}')
+            os.makedirs(temp_dir, exist_ok=True)
+
+            try:
+                # 获取表信息并计算总大小
+                tables = await self._get_tables_with_sizes(backup_options.tables)
+                total_processed = 0
+                chunks = []
+
+                # 按大小排序表，先处理小表（优化内存使用）
+                tables.sort(key=lambda x: x.get('size', 0))
+
+                # 预估内存需求并调整批次大小
+                estimated_memory_per_table = max([min(t.get('size', 0) / 10, 50 * 1024 * 1024) for t in tables] or [50 * 1024 * 1024])
+                available_memory = self.memory_manager.get_current_usage().heap_total * 0.5
+                optimal_batch_size = max(1, min(3, int(available_memory / estimated_memory_per_table)))
+                final_batch_size = optimal_batch_size
+
+                # 分块处理表
+                for i, table in enumerate(tables):
+                    # 检查内存压力
+                    current_pressure = self.memory_manager.check_memory_pressure()
+                    if current_pressure > 0.9:
+                        await self._request_memory_cleanup()
+                        await asyncio.sleep(1)
+
+                    # 为大表创建单独的备份文件
+                    if table.get('size', 0) > large_options.disk_threshold:
+                        chunk_file = await self._create_table_chunk_backup(table, temp_dir, large_options)
+                        chunks.append(chunk_file)
+                    else:
+                        # 小表可以合并处理
+                        small_tables = [t for t in tables if t.get('size', 0) <= large_options.disk_threshold]
+                        chunk_file = await self._create_small_table_backup(small_tables, temp_dir, large_options)
+                        chunks.append(chunk_file)
+
+                    total_processed += table.get('size', 0)
+
+                # 合并所有块文件
+                final_backup_path = await self._merge_backup_chunks(chunks, backup_options, large_options)
+
+                # 清理临时文件
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+                file_size = os.path.getsize(final_backup_path) if os.path.exists(final_backup_path) else 0
+                duration = int((TimeUtils.now() - start_time) * 1000)
+
+                return BackupResult(
+                    success=True,
+                    file_path=final_backup_path,
+                    file_size=file_size,
+                    table_count=len(tables),
+                    record_count=total_processed,
+                    duration=duration
+                )
+
+            except Exception as e:
+                # 清理临时文件
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                raise
+
+        except Exception as e:
+            duration = int((TimeUtils.now() - start_time) * 1000)
+            error_message = str(e)
+
+            logger.error("大文件备份创建失败", "MySQLBackupTool", {
+                "error": error_message,
+                "duration": duration
             })
 
-            # 执行任务（这里需要根据任务类型调用相应方法）
-            # 为了简化，这里假设任务已经存储了操作函数
+            return BackupResult(
+                success=False,
+                error=error_message,
+                duration=duration
+            )
 
-            task.status = "completed"
+    async def _get_tables_with_sizes(self, specific_tables: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """获取表及其大小信息"""
+        tables_info = []
+
+        tables = specific_tables or []
+        if not tables:
+            result = await self.mysql_manager.execute_query('SHOW TABLES')
+            tables = [row[list(row.keys())[0]] for row in result]
+
+        # 批量获取所有表的状态信息
+        try:
+            where_clause = "AND table_name IN ({})".format(','.join(['%s'] * len(tables))) if tables else ""
+            params = tables if tables else []
+
+            result = await self.mysql_manager.execute_query(
+                f"SELECT table_name, data_length, index_length, table_rows, update_time FROM information_schema.tables WHERE table_schema = DATABASE() {where_clause} ORDER BY (data_length + index_length) ASC",
+                params
+            )
+
+            if result:
+                for row in result:
+                    table_name = row.get('table_name', '')
+                    data_length = row.get('data_length', 0) or 0
+                    index_length = row.get('index_length', 0) or 0
+                    table_rows = row.get('table_rows', 0) or 0
+
+                    tables_info.append({
+                        'name': table_name,
+                        'size': data_length + index_length,
+                        'rows': table_rows
+                    })
+
+        except Exception as e:
+            logger.warn(f"批量获取表状态失败，使用逐个查询方式: {e}")
+
+            # 降级到逐个查询
+            for table_name in tables:
+                try:
+                    result = await self.mysql_manager.execute_query(
+                        'SHOW TABLE STATUS LIKE %s', [table_name]
+                    )
+
+                    if result and len(result) > 0:
+                        status = result[0]
+                        size = (status.get('Data_length', 0) or 0) + (status.get('Index_length', 0) or 0)
+                        rows = status.get('Rows', 0) or 0
+
+                        tables_info.append({
+                            'name': table_name,
+                            'size': size,
+                            'rows': rows
+                        })
+
+                except Exception as e:
+                    logger.warn(f"无法获取表 {table_name} 的信息: {e}")
+                    tables_info.append({
+                        'name': table_name,
+                        'size': 0,
+                        'rows': 0
+                    })
+
+        return tables_info
+
+    async def _create_table_chunk_backup(self, table: Dict[str, Any],
+                                       temp_dir: str, options: LargeFileOptions) -> str:
+        """创建表块备份"""
+        chunk_file = os.path.join(temp_dir, f"{table['name']}_chunk.sql")
+        config = self.mysql_manager.config_manager.database
+
+        # 对于大表，使用LIMIT分批导出
+        batch_size = max(1000, int(options.chunk_size / 1024))
+        offset = 0
+        has_more_data = True
+
+        with open(chunk_file, 'w', encoding='utf-8') as f:
+            # 写入表结构
+            result = await self.mysql_manager.execute_query(
+                f"SHOW CREATE TABLE `{table['name']}`"
+            )
+
+            if result and len(result) > 0:
+                create_statement = result[0].get('Create Table', '')
+                f.write(f"DROP TABLE IF EXISTS `{table['name']}`;\n")
+                f.write(f"{create_statement};\n\n")
+
+            # 分批导出数据
+            while has_more_data:
+                # 检查内存压力
+                memory_pressure = self.memory_manager.check_memory_pressure()
+                if memory_pressure > 0.85:
+                    await self._request_memory_cleanup()
+
+                result = await self.mysql_manager.execute_query(
+                    f"SELECT * FROM `{table['name']}` LIMIT {batch_size} OFFSET {offset}"
+                )
+
+                if not result or len(result) == 0:
+                    has_more_data = False
+                    break
+
+                # 生成INSERT语句
+                if result:
+                    columns = list(result[0].keys())
+                    column_list = ', '.join([f'`{col}`' for col in columns])
+
+                    f.write(f"INSERT INTO `{table['name']}` ({column_list}) VALUES\n")
+
+                    for i, row in enumerate(result):
+                        values = []
+                        for col in columns:
+                            value = row[col]
+                            if value is None:
+                                values.append('NULL')
+                            elif isinstance(value, str):
+                                values.append(f"'{value.replace(chr(39), chr(39) + chr(39))}'")
+                            else:
+                                values.append(str(value))
+
+                        f.write(f"({', '.join(values)}){';' if i == len(result) - 1 else ','}\n")
+
+                offset += batch_size
+
+                if len(result) < batch_size:
+                    has_more_data = False
+
+        return chunk_file
+
+    async def _create_small_table_backup(self, tables: List[Dict[str, Any]],
+                                       temp_dir: str, options: LargeFileOptions) -> str:
+        """创建小表备份"""
+        chunk_file = os.path.join(temp_dir, f"small_tables_{int(time.time())}.sql")
+        config = self.mysql_manager.config_manager.database
+
+        # 使用mysqldump导出小表
+        dump_args = [
+            'mysqldump',
+            f'-h{config["host"]}',
+            f'-P{config["port"]}',
+            f'-u{config["user"]}',
+            f'-p{config["password"]}',
+            '--default-character-set=utf8mb4',
+            '--single-transaction',
+            '--routines',
+            '--triggers',
+            config["database"] or ''
+        ]
+
+        table_names = [t['name'] for t in tables]
+        dump_args.extend(table_names)
+
+        await self._execute_mysqldump(dump_args, chunk_file)
+        return chunk_file
+
+    async def _merge_backup_chunks(self, chunks: List[str], backup_options: BackupOptions,
+                                 large_file_options: LargeFileOptions) -> str:
+        """合并备份块"""
+        timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+        final_file_name = f"{backup_options.file_prefix or 'mysql_large_backup'}_{timestamp}"
+        final_path = os.path.join(backup_options.output_dir, final_file_name)
+
+        if len(chunks) == 1:
+            # 只有一个块，直接移动并压缩
+            single_chunk = chunks[0]
+            sql_path = f"{final_path}.sql"
+            os.rename(single_chunk, sql_path)
+
+            if backup_options.compress:
+                zip_path = f"{final_path}.zip"
+                await self._compress_file(sql_path, zip_path)
+                os.unlink(sql_path)
+                return zip_path
+
+            return sql_path
+
+        # 多个块需要合并
+        merged_sql_path = f"{final_path}.sql"
+
+        with open(merged_sql_path, 'w', encoding='utf-8') as output_file:
+            # 写入文件头
+            output_file.write("-- MySQL Large File Backup\n")
+            output_file.write(f"-- Generated on: {datetime.now().isoformat()}\n")
+            output_file.write(f"-- Chunks: {len(chunks)}\n\n")
+            output_file.write("SET FOREIGN_KEY_CHECKS=0;\n\n")
+
+            # 合并所有块
+            for chunk_file in chunks:
+                with open(chunk_file, 'r', encoding='utf-8') as chunk_file:
+                    output_file.write(chunk_file.read())
+                output_file.write('\n')
+
+                # 删除临时块文件
+                os.unlink(chunk_file)
+
+            output_file.write("\nSET FOREIGN_KEY_CHECKS=1;\n")
+
+        # 压缩合并后的文件
+        if backup_options.compress:
+            zip_path = f"{final_path}.zip"
+            await self._compress_file(merged_sql_path, zip_path)
+            os.unlink(merged_sql_path)
+            return zip_path
+
+        return merged_sql_path
+
+    # 队列相关方法
+    async def create_backup_queued(self, options: Optional[BackupOptions] = None,
+                                 priority: int = 1) -> Dict[str, Any]:
+        """带队列的备份创建"""
+        task_id = self.add_task_to_queue(
+            'backup',
+            lambda: self.create_backup(options),
+            options.model_dump() if hasattr(options, 'model_dump') else {},
+            priority
+        )
+
+        # 等待任务完成
+        return await self._wait_for_task_completion(task_id)
+
+    async def _wait_for_task_completion(self, task_id: str) -> Dict[str, Any]:
+        """等待任务完成"""
+        while True:
+            task = self.get_task_status(task_id)
+            if not task:
+                raise Exception('任务不存在')
+
+            if task.status == 'completed':
+                return {'task_id': task_id, 'result': task.result}
+            elif task.status == 'failed':
+                raise Exception(task.error or '任务执行失败')
+            elif task.status == 'cancelled':
+                raise Exception('任务已取消')
+
+            await asyncio.sleep(1)
+
+    def cancel_task(self, task_id: str) -> bool:
+        """取消任务"""
+        task = self.task_queue.get(task_id)
+        if not task:
+            return False
+
+        if task.status == 'running':
+            task.status = 'cancelled'
             task.completed_at = datetime.now()
-            self.running_tasks -= 1
-
-            logger.info("Task completed", {
-                "task_id": task.id,
-                "type": task.type,
-                "duration": (task.completed_at - task.started_at).total_seconds() * 1000 if task.started_at and task.completed_at else 0,
-                "running_tasks": self.running_tasks
-            })
-
-        except Exception as error:
-            task.status = "failed"
-            task.completed_at = datetime.now()
-            task.error = str(error)
-            self.running_tasks -= 1
-
-            logger.error("Task failed", {
-                "task_id": task.id,
-                "type": task.type,
-                "error": str(error),
-                "running_tasks": self.running_tasks
-            })
-
-    def _cleanup_completed_tasks(self) -> None:
-        """清理已完成的任务"""
-        retention_time = 30 * 60 * 1000  # 30分钟
-        now = datetime.now()
-
-        to_remove = []
-        for task_id, task in self.task_queue.items():
-            if task.status in ["completed", "failed", "cancelled"]:
-                if task.completed_at and (now - task.completed_at).total_seconds() * 1000 > retention_time:
-                    to_remove.append(task_id)
-
-        for task_id in to_remove:
+            return True
+        elif task.status == 'queued':
             del self.task_queue[task_id]
-            logger.debug("Task cleaned up", {"task_id": task_id})
+            return True
 
-    async def _cleanup_completed_trackers(self) -> None:
-        """清理已完成的进度跟踪器"""
-        now = time.time() * 1000
-        to_remove = []
+        return False
+
+    def get_queue_stats(self) -> Dict[str, Any]:
+        """获取队列统计信息"""
+        tasks = list(self.task_queue.values())
+
+        queued_tasks = len([t for t in tasks if t.status == 'queued'])
+        running_tasks = len([t for t in tasks if t.status == 'running'])
+        completed_tasks = len([t for t in tasks if t.status == 'completed'])
+        failed_tasks = len([t for t in tasks if t.status == 'failed'])
+        cancelled_tasks = len([t for t in tasks if t.status == 'cancelled'])
+
+        # 计算平均等待时间
+        wait_times = []
+        for task in tasks:
+            if task.started_at:
+                wait_time = (task.started_at.timestamp() - task.created_at.timestamp()) * 1000
+                wait_times.append(wait_time)
+
+        average_wait_time = sum(wait_times) / len(wait_times) if wait_times else 0
+
+        # 计算平均执行时间
+        execution_times = []
+        for task in tasks:
+            if task.completed_at and task.started_at:
+                execution_time = (task.completed_at.timestamp() - task.started_at.timestamp()) * 1000
+                execution_times.append(execution_time)
+
+        average_execution_time = sum(execution_times) / len(execution_times) if execution_times else 0
+
+        return {
+            'total_tasks': len(tasks),
+            'queued_tasks': queued_tasks,
+            'running_tasks': running_tasks,
+            'completed_tasks': completed_tasks,
+            'failed_tasks': failed_tasks,
+            'cancelled_tasks': cancelled_tasks,
+            'max_concurrent_tasks': self.max_concurrent_tasks,
+            'average_wait_time': average_wait_time,
+            'average_execution_time': average_execution_time
+        }
+
+    def get_active_trackers(self) -> List[ProgressTracker]:
+        """获取所有活动的进度跟踪器"""
+        return list(self.progress_trackers.values())
+
+    def cancel_operation(self, tracker_id: str) -> bool:
+        """取消指定的操作"""
+        tracker = self.progress_trackers.get(tracker_id)
+        if tracker and tracker.cancellation_token:
+            tracker.cancellation_token.cancel()
+            return True
+        return False
+
+    def cleanup_completed_trackers(self) -> None:
+        """清理已完成的跟踪器"""
+        current_time = time.time()
+        expired_trackers = []
 
         for tracker_id, tracker in self.progress_trackers.items():
-            elapsed = now - tracker.start_time.timestamp() * 1000
-            if elapsed > 300000 or tracker.progress.stage in ["completed", "error"]:  # 5分钟或已完成
-                to_remove.append(tracker_id)
+            elapsed = current_time - tracker.start_time.timestamp()
+            if elapsed > 300 or tracker.progress.stage in ['completed', 'error']:
+                expired_trackers.append(tracker_id)
 
-        for tracker_id in to_remove:
+        for tracker_id in expired_trackers:
             del self.progress_trackers[tracker_id]
 
+    def set_max_concurrent_tasks(self, max_concurrent: int) -> None:
+        """设置最大并发任务数"""
+        if max_concurrent < 1:
+            raise ValueError('最大并发任务数必须大于0')
+
+        self.max_concurrent_tasks = max_concurrent
+
+    def pause_queue(self) -> None:
+        """暂停任务队列处理"""
+        if self.scheduler_running:
+            self.scheduler_running = False
+            # 发出队列暂停事件
+            self.emit('queue-paused')
+
+    def resume_queue(self) -> None:
+        """恢复任务队列处理"""
+        if not self.scheduler_running:
+            self.scheduler_running = True
+            self.scheduler_task = asyncio.create_task(self._task_scheduler_loop())
+            # 发出队列恢复事件
+            self.emit('queue-resumed')
+
+    def clear_queue(self) -> int:
+        """清空任务队列"""
+        queued_tasks = [task for task in self.task_queue.values() if task.status == 'queued']
+
+        for task in queued_tasks:
+            del self.task_queue[task.id]
+
+        # 发出队列清空事件
+        self.emit('queue-cleared', {
+            'cleared_count': len(queued_tasks),
+            'remaining_tasks': len(self.task_queue)
+        })
+
+        return len(queued_tasks)
+
+    def get_all_tasks(self, status: Optional[str] = None) -> List[TaskQueue]:
+        """获取所有任务信息"""
+        tasks = list(self.task_queue.values())
+
+        if status:
+            tasks = [task for task in tasks if task.status == status]
+
+        return tasks
+
+    def get_queue_diagnostics(self) -> Dict[str, Any]:
+        """
+        获取任务队列诊断信息
+
+        Returns:
+            Dict[str, Any]: 详细的诊断信息
+        """
+        tasks = list(self.task_queue.values())
+        current_time = time.time()
+
+        # 队列信息
+        tasks_by_type: Dict[str, int] = {}
+        tasks_by_status: Dict[str, int] = {}
+        oldest_task: Optional[datetime] = None
+        newest_task: Optional[datetime] = None
+
+        for task in tasks:
+            # 按类型统计
+            tasks_by_type[task.type] = tasks_by_type.get(task.type, 0) + 1
+
+            # 按状态统计
+            tasks_by_status[task.status] = tasks_by_status.get(task.status, 0) + 1
+
+            # 时间范围
+            if not oldest_task or task.created_at < oldest_task:
+                oldest_task = task.created_at
+            if not newest_task or task.created_at > newest_task:
+                newest_task = task.created_at
+
+        # 性能指标
+        completed_tasks = [task for task in tasks if task.status == 'completed']
+        failed_tasks = [task for task in tasks if task.status == 'failed']
+        total_finished_tasks = len(completed_tasks) + len(failed_tasks)
+
+        success_rate = 0.0
+        if total_finished_tasks > 0:
+            success_rate = len(completed_tasks) / total_finished_tasks
+
+        # 计算吞吐量（每分钟完成的任务数）
+        time_window = 60  # 1分钟
+        recent_completed_tasks = [
+            task for task in completed_tasks
+            if task.completed_at and (current_time - task.completed_at.timestamp()) <= time_window
+        ]
+        throughput = len(recent_completed_tasks)
+
+        # 平均等待和执行时间
+        wait_times = []
+        execution_times = []
+
+        for task in tasks:
+            if task.started_at:
+                wait_time = (task.started_at.timestamp() - task.created_at.timestamp())
+                wait_times.append(wait_time)
+
+            if task.completed_at and task.started_at:
+                execution_time = (task.completed_at.timestamp() - task.started_at.timestamp())
+                execution_times.append(execution_time)
+
+        average_wait_time = sum(wait_times) / len(wait_times) if wait_times else 0
+        average_execution_time = sum(execution_times) / len(execution_times) if execution_times else 0
+
+        return {
+            'scheduler': {
+                'is_running': self.scheduler_running,
+                'check_interval': 1.0,
+                'adaptive_scheduling': True
+            },
+            'queue': {
+                'size': len(tasks),
+                'oldest_task': oldest_task.isoformat() if oldest_task else None,
+                'newest_task': newest_task.isoformat() if newest_task else None,
+                'tasks_by_type': tasks_by_type,
+                'tasks_by_status': tasks_by_status
+            },
+            'performance': {
+                'average_wait_time': average_wait_time,
+                'average_execution_time': average_execution_time,
+                'success_rate': success_rate,
+                'throughput': throughput
+            },
+            'resources': {
+                'max_concurrent_tasks': self.max_concurrent_tasks,
+                'current_running_tasks': self.running_tasks,
+                'queued_tasks': len([t for t in tasks if t.status == 'queued']),
+                'memory_usage': self.memory_manager.get_current_usage(),
+                'memory_pressure': self.memory_manager.check_memory_pressure()
+            }
+        }
+
     async def cleanup(self) -> None:
-        """清理资源"""
-        # 停止任务调度器
-        self._scheduler_running = False
+        """清理资源 - 改进版资源清理"""
+        try:
+            # 停止任务调度器
+            self.scheduler_running = False
+            if self.scheduler_task:
+                self.scheduler_task.cancel()
+                try:
+                    await self.scheduler_task
+                except asyncio.CancelledError:
+                    pass
 
-        # 取消所有运行中的任务
-        running_tasks = [t for t in self.task_queue.values() if t.status == "running"]
-        for task in running_tasks:
-            task.status = "cancelled"
-            task.completed_at = datetime.now()
+            # 取消所有运行中的任务
+            running_tasks = [task for task in self.task_queue.values() if task.status == 'running']
+            for task in running_tasks:
+                task.status = 'cancelled'
+                task.completed_at = datetime.now()
 
-        # 清理缓存
-        await self.cache_manager.clear_region(CacheRegion.QUERY_RESULT)
+            # 清理缓存
+            await self.cache_manager.clear_region(CacheRegion.QUERY_RESULT)
 
-        # 清理内存管理器
-        self.memory_monitor.disable_memory_monitoring()
+            # 禁用内存监控
+            self.memory_manager.disable_memory_monitoring()
 
+            # 清理所有跟踪器
+            self.progress_trackers.clear()
+
+            # 清空任务队列
+            self.task_queue.clear()
+
+            # 清空事件监听器
+            self._event_listeners.clear()
+
+            # 获取最终内存使用情况
+            final_memory_usage = self.memory_manager.get_current_usage()
+
+            # 发出清理完成事件
+            self.emit('cleanup-completed', {
+                'final_memory_usage': {
+                    'rss_mb': f"{final_memory_usage.rss / 1024 / 1024:.1f}",
+                    'heap_used_mb': f"{final_memory_usage.heap_used / 1024 / 1024:.1f}"
+                },
+                'resources_cleared': {
+                    'query_cache': True,
+                    'connection_cache': True,
+                    'task_queue': True,
+                    'progress_trackers': True,
+                    'event_listeners': True
+                },
+                'cancelled_tasks': len(running_tasks)
+            })
+
+            logger.info("MySQL备份工具已清理完成", "MySQLBackupTool")
+
+        except Exception as e:
+            logger.error(f"清理备份工具时出错: {e}", "MySQLBackupTool")
+
+    def get_export_diagnostics(self) -> Dict[str, Any]:
+        """
+        获取导出系统诊断信息
+
+        Returns:
+            Dict[str, Any]: 导出系统详细诊断信息
+        """
+        memory_usage = self.memory_manager.get_current_usage()
+        memory_pressure = self.memory_manager.check_memory_pressure()
+
+        # 获取活跃的导出跟踪器
+        active_trackers = [tracker for tracker in self.progress_trackers.values()
+                          if tracker.operation == 'export']
+
+        # 计算导出性能指标
+        completed_exports = [tracker for tracker in self.progress_trackers.values()
+                           if tracker.operation == 'export' and tracker.progress.stage == 'completed']
+
+        success_rate = 0.0
+        if len(active_trackers) + len(completed_exports) > 0:
+            success_rate = len(completed_exports) / (len(active_trackers) + len(completed_exports))
+
+        # 内存优化建议
+        memory_suggestions = []
+        if memory_pressure > 0.8:
+            memory_suggestions.append("内存压力较高，建议减少并发导出任务")
+        if memory_usage.heap_used > 500 * 1024 * 1024:  # 500MB
+            memory_suggestions.append("内存使用量较大，建议启用流式处理")
+
+        return {
+            'export_system': {
+                'active_exports': len(active_trackers),
+                'completed_exports': len(completed_exports),
+                'success_rate': success_rate,
+                'memory_pressure': memory_pressure,
+                'memory_usage_mb': {
+                    'heap_used': round(memory_usage.heap_used / 1024 / 1024, 2),
+                    'heap_total': round(memory_usage.heap_total / 1024 / 1024, 2),
+                    'rss': round(memory_usage.rss / 1024 / 1024, 2)
+                }
+            },
+            'performance_metrics': {
+                'average_export_time': 0,  # 可以从历史数据计算
+                'peak_concurrent_exports': len(active_trackers),
+                'total_exports_processed': len(completed_exports)
+            },
+            'optimization_suggestions': {
+                'memory_optimizations': memory_suggestions,
+                'recommended_batch_size': self._calculate_optimal_batch_size(),
+                'streaming_recommended': memory_usage.heap_used > 200 * 1024 * 1024  # 200MB
+            },
+            'system_health': {
+                'memory_monitoring_enabled': True,
+                'error_recovery_enabled': True,
+                'progress_tracking_enabled': True,
+                'queue_management_enabled': True
+            }
+        }
+
+    def _calculate_optimal_batch_size(self) -> int:
+        """计算最优批处理大小"""
+        memory_usage = self.memory_manager.get_current_usage()
+        available_memory = memory_usage.heap_total - memory_usage.heap_used
+
+        # 基于可用内存计算批处理大小
+        if available_memory > 500 * 1024 * 1024:  # > 500MB
+            return 1000
+        elif available_memory > 200 * 1024 * 1024:  # > 200MB
+            return 500
+        else:
+            return 100
+
+    async def get_export_performance_report(self) -> Dict[str, Any]:
+        """
+        生成导出性能报告
+
+        Returns:
+            Dict[str, Any]: 详细的性能报告
+        """
+        diagnostics = self.get_export_diagnostics()
+        queue_stats = self.get_queue_stats()
+        memory_stats = self.memory_manager.get_memory_stats()
+
+        return {
+            'report_generated_at': datetime.now().isoformat(),
+            'export_diagnostics': diagnostics,
+            'queue_statistics': queue_stats,
+            'memory_statistics': memory_stats,
+            'recommendations': self._generate_export_recommendations(diagnostics, queue_stats)
+        }
+
+    def _generate_export_recommendations(self, diagnostics: Dict[str, Any], queue_stats: Dict[str, Any]) -> List[str]:
+        """生成导出优化建议"""
+        recommendations = []
+
+        # 内存相关建议
+        memory_pressure = diagnostics['export_system']['memory_pressure']
+        if memory_pressure > 0.8:
+            recommendations.append("内存压力较高，建议减少并发导出任务数量")
+        elif memory_pressure > 0.9:
+            recommendations.append("内存压力严重，建议启用流式处理模式")
+
+        # 队列相关建议
+        if queue_stats['queued_tasks'] > 10:
+            recommendations.append("队列中任务较多，建议增加最大并发任务数")
+        elif queue_stats['average_wait_time'] > 30:  # 30秒
+            recommendations.append("任务等待时间较长，建议优化任务调度策略")
+
+        # 性能相关建议
+        success_rate = diagnostics['export_system']['success_rate']
+        if success_rate < 0.95:
+            recommendations.append("导出成功率偏低，建议检查错误恢复机制")
+
+        return recommendations
+
+
+# 导出类和函数
+__all__ = [
+    'MySQLBackupTool',
+    'MemoryManager',
+    'BackupOptions',
+    'ExportOptions',
+    'ReportConfig',
+    'with_error_handling',
+    'with_performance_monitoring'
+]

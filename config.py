@@ -18,7 +18,7 @@ from typing import List
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 
-from constants import DEFAULT_CONFIG, STRING_CONSTANTS
+from constants import DefaultConfig, StringConstants
 
 # 加载环境变量配置
 load_dotenv()
@@ -30,16 +30,16 @@ class DatabaseConfig(BaseModel):
     定义完整的 MySQL 数据库连接和连接池配置参数。
     包含数据库连接参数、SSL 设置、超时配置和连接池管理参数。
     """
-    host: str = Field(default_factory=lambda: os.getenv(STRING_CONSTANTS["ENV_MYSQL_HOST"], STRING_CONSTANTS["DEFAULT_HOST"]))
-    port: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_MYSQL_PORT"], str(DEFAULT_CONFIG["MYSQL_PORT"]))))
-    user: str = Field(default_factory=lambda: os.getenv(STRING_CONSTANTS["ENV_MYSQL_USER"], STRING_CONSTANTS["DEFAULT_USER"]))
-    password: str = Field(default_factory=lambda: os.getenv(STRING_CONSTANTS["ENV_MYSQL_PASSWORD"], STRING_CONSTANTS["DEFAULT_PASSWORD"]))
-    database: str = Field(default_factory=lambda: os.getenv(STRING_CONSTANTS["ENV_MYSQL_DATABASE"], STRING_CONSTANTS["DEFAULT_DATABASE"]))
-    connection_limit: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_CONNECTION_LIMIT"], str(DEFAULT_CONFIG["CONNECTION_LIMIT"]))))
-    min_connections: int = DEFAULT_CONFIG["MIN_CONNECTIONS"]
-    connect_timeout: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_CONNECT_TIMEOUT"], str(DEFAULT_CONFIG["CONNECT_TIMEOUT"]))))
-    idle_timeout: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_IDLE_TIMEOUT"], str(DEFAULT_CONFIG["IDLE_TIMEOUT"]))))
-    ssl_enabled: bool = Field(default_factory=lambda: os.getenv(STRING_CONSTANTS["ENV_MYSQL_SSL"], "").lower() == STRING_CONSTANTS["TRUE_STRING"])
+    host: str = Field(default_factory=lambda: os.getenv(StringConstants.ENV_MYSQL_HOST, StringConstants.DEFAULT_HOST))
+    port: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_MYSQL_PORT, str(DefaultConfig.MYSQL_PORT))))
+    user: str = Field(default_factory=lambda: os.getenv(StringConstants.ENV_MYSQL_USER, StringConstants.DEFAULT_USER))
+    password: str = Field(default_factory=lambda: os.getenv(StringConstants.ENV_MYSQL_PASSWORD, StringConstants.DEFAULT_PASSWORD))
+    database: str = Field(default_factory=lambda: os.getenv(StringConstants.ENV_MYSQL_DATABASE, StringConstants.DEFAULT_DATABASE))
+    connection_limit: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_CONNECTION_LIMIT, str(DefaultConfig.CONNECTION_LIMIT))))
+    min_connections: int = DefaultConfig.MIN_CONNECTIONS
+    connect_timeout: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_CONNECT_TIMEOUT, str(DefaultConfig.CONNECT_TIMEOUT))))
+    idle_timeout: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_IDLE_TIMEOUT, str(DefaultConfig.IDLE_TIMEOUT))))
+    ssl_enabled: bool = Field(default_factory=lambda: os.getenv(StringConstants.ENV_MYSQL_SSL, "").lower() == StringConstants.TRUE_STRING)
 
     @field_validator('port')
     @classmethod
@@ -69,17 +69,17 @@ class SecurityConfig(BaseModel):
     定义查询执行和访问控制的安全策略和限制参数。
     包含查询长度限制、速率限制、结果集限制和访问控制配置。
     """
-    max_query_length: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_MAX_QUERY_LENGTH"], str(DEFAULT_CONFIG["MAX_QUERY_LENGTH"]))))
+    max_query_length: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_MAX_QUERY_LENGTH, str(DefaultConfig.MAX_QUERY_LENGTH))))
     allowed_query_types: List[str] = Field(default_factory=lambda: [
         t.strip().upper() for t in os.getenv(
-            STRING_CONSTANTS["ENV_ALLOWED_QUERY_TYPES"],
-            STRING_CONSTANTS["DEFAULT_ALLOWED_QUERY_TYPES"]
+            StringConstants.ENV_ALLOWED_QUERY_TYPES,
+            StringConstants.DEFAULT_ALLOWED_QUERY_TYPES
         ).split(',')
     ])
-    max_result_rows: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_MAX_RESULT_ROWS"], str(DEFAULT_CONFIG["MAX_RESULT_ROWS"]))))
-    query_timeout: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_QUERY_TIMEOUT"], str(DEFAULT_CONFIG["QUERY_TIMEOUT"]))))
-    rate_limit_max: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_RATE_LIMIT_MAX"], str(DEFAULT_CONFIG["RATE_LIMIT_MAX"]))))
-    rate_limit_window: int = Field(default_factory=lambda: int(os.getenv(STRING_CONSTANTS["ENV_RATE_LIMIT_WINDOW"], str(DEFAULT_CONFIG["RATE_LIMIT_WINDOW"]))))
+    max_result_rows: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_MAX_RESULT_ROWS, str(DefaultConfig.MAX_RESULT_ROWS))))
+    query_timeout: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_QUERY_TIMEOUT, str(DefaultConfig.QUERY_TIMEOUT))))
+    rate_limit_max: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_RATE_LIMIT_MAX, str(DefaultConfig.RATE_LIMIT_MAX))))
+    rate_limit_window: int = Field(default_factory=lambda: int(os.getenv(StringConstants.ENV_RATE_LIMIT_WINDOW, str(DefaultConfig.RATE_LIMIT_WINDOW))))
 
     @field_validator('max_query_length', 'max_result_rows')
     @classmethod
@@ -102,13 +102,13 @@ class CacheConfig(BaseModel):
     定义数据库元数据缓存系统的参数配置。
     包含不同缓存类型（模式、表存在性、索引、查询结果）的大小和生命周期设置。
     """
-    schema_cache_size: int = Field(default_factory=lambda: int(os.getenv("SCHEMA_CACHE_SIZE", str(DEFAULT_CONFIG["SCHEMA_CACHE_SIZE"]))))
-    table_exists_cache_size: int = Field(default_factory=lambda: int(os.getenv("TABLE_EXISTS_CACHE_SIZE", str(DEFAULT_CONFIG["TABLE_EXISTS_CACHE_SIZE"]))))
-    index_cache_size: int = Field(default_factory=lambda: int(os.getenv("INDEX_CACHE_SIZE", str(DEFAULT_CONFIG["INDEX_CACHE_SIZE"]))))
-    cache_ttl: int = Field(default_factory=lambda: int(os.getenv("CACHE_TTL", str(DEFAULT_CONFIG["CACHE_TTL"]))))
+    schema_cache_size: int = Field(default_factory=lambda: int(os.getenv("SCHEMA_CACHE_SIZE", str(DefaultConfig.SCHEMA_CACHE_SIZE))))
+    table_exists_cache_size: int = Field(default_factory=lambda: int(os.getenv("TABLE_EXISTS_CACHE_SIZE", str(DefaultConfig.TABLE_EXISTS_CACHE_SIZE))))
+    index_cache_size: int = Field(default_factory=lambda: int(os.getenv("INDEX_CACHE_SIZE", str(DefaultConfig.INDEX_CACHE_SIZE))))
+    cache_ttl: int = Field(default_factory=lambda: int(os.getenv("CACHE_TTL", str(DefaultConfig.CACHE_TTL))))
     enable_query_cache: bool = Field(default_factory=lambda: os.getenv("ENABLE_QUERY_CACHE", "true").lower() == "true")
     query_cache_size: int = Field(default_factory=lambda: int(os.getenv("QUERY_CACHE_SIZE", "1000")))
-    query_cache_ttl: int = Field(default_factory=lambda: int(os.getenv("QUERY_CACHE_TTL", str(DEFAULT_CONFIG["CACHE_TTL"]))))
+    query_cache_ttl: int = Field(default_factory=lambda: int(os.getenv("QUERY_CACHE_TTL", str(DefaultConfig.CACHE_TTL))))
     max_query_result_size: int = Field(default_factory=lambda: int(os.getenv("MAX_QUERY_RESULT_SIZE", "1048576")))
     enable_tiered_cache: bool = Field(default_factory=lambda: os.getenv("ENABLE_TIERED_CACHE", "false").lower() == "true")
     enable_ttl_adjustment: bool = Field(default_factory=lambda: os.getenv("ENABLE_TTL_ADJUSTMENT", "false").lower() == "true")

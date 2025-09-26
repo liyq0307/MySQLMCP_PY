@@ -25,12 +25,22 @@ try:
     import asyncmy
     from asyncmy import connect, Connection
     from asyncmy.pool import create_pool, Pool
-except ImportError as e:
-    raise ImportError(f"缺少必要的依赖: {e}。请安装: pip install asyncmy")
+    ASYNCMY_AVAILABLE = True
+except ImportError:
+    ASYNCMY_AVAILABLE = False
+    # 创建占位符类以避免导入错误
+    class Connection:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("asyncmy 未安装，无法创建数据库连接。请安装: pip install asyncmy")
+    class Pool:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("asyncmy 未安装，无法创建连接池。请安装: pip install asyncmy")
+    def create_pool(*args, **kwargs):
+        raise RuntimeError("asyncmy 未安装，无法创建连接池。请安装: pip install asyncmy")
 
 from config import DatabaseConfig
 from constants import (
-    DEFAULT_CONFIG, STRING_CONSTANTS
+    DefaultConfig, StringConstants
 )
 from logger import logger
 from type_utils import MySQLMCPError, ErrorCategory, ErrorSeverity
@@ -161,8 +171,8 @@ class ConnectionPool:
         self.circuit_breaker_state: str = CircuitBreakerState.CLOSED
         self.circuit_breaker_failures: int = 0
         self.circuit_breaker_last_fail_time: float = 0
-        self.circuit_breaker_threshold: int = DEFAULT_CONFIG.get("CIRCUIT_BREAKER_THRESHOLD", 5)
-        self.circuit_breaker_timeout: float = DEFAULT_CONFIG.get("CIRCUIT_BREAKER_TIMEOUT", 30000) / 1000  # 转换为秒
+        self.circuit_breaker_threshold: int = DefaultConfig.CIRCUIT_BREAKER_THRESHOLD
+        self.circuit_breaker_timeout: float = DefaultConfig.CIRCUIT_BREAKER_TIMEOUT
         self.circuit_breaker_half_open_requests: int = 0
 
     async def initialize(self) -> None:
@@ -190,7 +200,7 @@ class ConnectionPool:
                 'maxsize': self.current_connection_limit,
                 'connect_timeout': self.config.connect_timeout,
                 'autocommit': True,
-                'charset': STRING_CONSTANTS["CHARSET"]
+                'charset': StringConstants.CHARSET
             }
 
             # 创建连接池
@@ -235,7 +245,7 @@ class ConnectionPool:
             while not self.shutdown_event:
                 try:
                     await self.perform_health_check()
-                    await asyncio.sleep(DEFAULT_CONFIG.get("HEALTH_CHECK_INTERVAL", 30))
+                    await asyncio.sleep(DefaultConfig.HEALTH_CHECK_INTERVAL)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -372,7 +382,7 @@ class ConnectionPool:
                     'maxsize': slave_config.connection_limit,
                     'connect_timeout': slave_config.connect_timeout,
                     'autocommit': True,
-                    'charset': STRING_CONSTANTS["CHARSET"]
+                    'charset': StringConstants.CHARSET
                 }
 
                 read_pool = await asyncmy.pool.create_pool(**pool_config)
@@ -466,7 +476,7 @@ class ConnectionPool:
                 'maxsize': new_connection_limit,
                 'connect_timeout': self.config.connect_timeout,
                 'autocommit': True,
-                'charset': STRING_CONSTANTS["CHARSET"]
+                'charset': StringConstants.CHARSET
             }
 
             self.pool = await asyncmy.pool.create_pool(**pool_config)
@@ -592,7 +602,7 @@ class ConnectionPool:
             while not self.shutdown_event:
                 try:
                     await self.detect_leaked_connections()
-                    await asyncio.sleep(DEFAULT_CONFIG.get("LEAK_DETECTION_INTERVAL", 30))
+                    await asyncio.sleep(DefaultConfig.LEAK_DETECTION_INTERVAL)
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
@@ -604,7 +614,7 @@ class ConnectionPool:
     async def detect_leaked_connections(self) -> None:
         """检测泄漏的连接"""
         now = time.time()
-        leak_threshold = DEFAULT_CONFIG.get("LEAK_THRESHOLD", 60)
+        leak_threshold = DefaultConfig.LEAK_THRESHOLD
         suspected_leaks = []
 
         async with self._active_connections_lock:
@@ -668,8 +678,8 @@ class ConnectionPool:
                 ErrorSeverity.HIGH
             )
 
-        max_retries = DEFAULT_CONFIG.get("MAX_RETRY_ATTEMPTS", 3)
-        base_delay = DEFAULT_CONFIG.get("RECONNECT_DELAY", 1)
+        max_retries = DefaultConfig.MAX_RETRY_ATTEMPTS
+        base_delay = DefaultConfig.RECONNECT_DELAY
         last_error = None
 
         # 重试机制
@@ -758,8 +768,8 @@ class ConnectionPool:
         self.current_read_pool_index = (self.current_read_pool_index + 1) % len(self.read_pools)
 
         read_pool = self.read_pools[pool_index]
-        max_retries = DEFAULT_CONFIG.get("MAX_RETRY_ATTEMPTS", 3)
-        base_delay = DEFAULT_CONFIG.get("RECONNECT_DELAY", 1)
+        max_retries = DefaultConfig.MAX_RETRY_ATTEMPTS
+        base_delay = DefaultConfig.RECONNECT_DELAY
 
         for attempt in range(max_retries + 1):
             try:
@@ -818,7 +828,7 @@ class ConnectionPool:
             Dict[str, Any]: 连接池统计信息
         """
         if not self.pool:
-            return {"status": STRING_CONSTANTS["STATUS_NOT_INITIALIZED"]}
+            return {"status": StringConstants.STATUS_NOT_INITIALIZED}
 
         return {
             "pool_name": self.config.database,

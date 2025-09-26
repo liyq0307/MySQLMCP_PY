@@ -30,7 +30,7 @@ from type_utils import (
     # 进度信息
     ProgressInfo, ImportStatistics
 )
-from constants import STRING_CONSTANTS, DEFAULT_CONFIG
+from constants import StringConstants, DefaultConfig
 
 __version__ = "1.0.0"
 __author__ = "liyq"
@@ -50,8 +50,7 @@ from rbac import rbac_manager, RBACManager
 from retry_strategy import smart_retry_strategy, SmartRetryStrategy
 from security import SecurityValidator, SecurityAuditor, security_pattern_detector
 from rate_limit import TokenBucketRateLimiter, AdaptiveRateLimiter
-from queue_manager import queue_manager, QueueManager
-from export_tool import exporter_factory, ExporterFactory, BaseExporter
+from export_tool import ExporterFactory, BaseExporter
 
 __all__ = [
     # 核心模块
@@ -109,6 +108,6 @@ __all__ = [
     "ImportStatistics",
 
     # 常量
-    "STRING_CONSTANTS",
-    "DEFAULT_CONFIG"
+    "StringConstants",
+    "DefaultConfig"
 ]

@@ -5,20 +5,6 @@ MySQL MCP 安全验证与审计系统 - 企业级安全防护体系
 为 Model Context Protocol (MCP) 提供安全、可靠、高效的安全验证服务，
 支持企业级应用的所有安全需求和合规性要求。
 
-核心安全模块：
-- 安全模式检测器：统一的威胁模式识别和分类
-- 安全验证器：多层输入验证和威胁防护
-- 安全审计器：全面的安全审计和合规性检查
-- 威胁分析引擎：智能威胁分析和风险评估
-
-安全特性：
-- 统一的安全模式检测器，避免重复代码
-- 多级验证模式（严格、中等、基础）
-- 字符编码和控制字符验证
-- 长度限制和结构验证
-- 智能威胁分析和风险评估
-- 企业级安全审计和报告生成
-
 @fileoverview MySQL MCP 企业级安全验证与审计系统 - 全面的安全防护解决方案
 @author liyq
 @version 1.0.0
@@ -35,7 +21,7 @@ from enum import Enum
 from type_utils import (
     MySQLMCPError, ErrorCategory, ErrorSeverity, ValidationLevel
 )
-from constants import DEFAULT_CONFIG
+from constants import DefaultConfig
 from rbac import rbac_manager
 from config import ConfigurationManager
 from logger import security_logger, SecurityEventType
@@ -920,7 +906,7 @@ class SecurityValidator:
             MySQLMCPError: 当数组未通过验证检查时抛出
         """
         # 数组长度验证
-        max_array_length = DEFAULT_CONFIG["MAX_INPUT_LENGTH"]
+        max_array_length = DefaultConfig.MAX_INPUT_LENGTH
         if len(value) > max_array_length:
             raise MySQLMCPError(
                 f"{field_name} 数组长度超过最大限制 ({max_array_length} 元素)",
@@ -958,7 +944,7 @@ class SecurityValidator:
             MySQLMCPError: 当对象未通过验证检查时抛出
         """
         # 对象属性数量验证
-        max_object_properties = DEFAULT_CONFIG["MAX_INPUT_LENGTH"]
+        max_object_properties = DefaultConfig.MAX_INPUT_LENGTH
         property_count = len(value)
         if property_count > max_object_properties:
             raise MySQLMCPError(
@@ -1026,9 +1012,9 @@ class SecurityValidator:
             )
 
         # 长度验证（安全：防止缓冲区溢出攻击）
-        if len(value) > DEFAULT_CONFIG["MAX_INPUT_LENGTH"]:
+        if len(value) > DefaultConfig.MAX_INPUT_LENGTH:
             raise MySQLMCPError(
-                f"{field_name} 超过最大长度限制 ({DEFAULT_CONFIG['MAX_INPUT_LENGTH']} 字符)",
+                f"{field_name} 超过最大长度限制 ({DefaultConfig.MAX_INPUT_LENGTH} 字符)",
                 ErrorCategory.SECURITY_VIOLATION,
                 ErrorSeverity.MEDIUM
             )
