@@ -1,19 +1,16 @@
-fastmcp>=2.0.0
-asyncmy>=0.2.8
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-openpyxl>=3.1.0
-pandas>=2.0.0
-psutil>=5.9.0
-cryptography>=41.0.0
-asyncio-mqtt>=0.13.0
+# 核心框架和数据库连接
+fastmcp>=2.0.0              # MCP服务器框架 - 提供FastMCP核心功能
+asyncmy>=0.2.8              # 异步MySQL客户端 - 提供异步数据库连接和操作
+pydantic>=2.0.0             # 数据验证框架 - 用于API参数验证和数据模型定义
+python-dotenv>=1.0.0        # 环境变量管理 - 加载.env配置文件
+
+# 数据处理和文件操作
+openpyxl>=3.1.0             # Excel文件处理 - 支持Excel导入导出功能
+aiofiles>=23.0.0            # 异步文件操作 - 提供异步文件读写能力
+
+# 系统监控和安全
+psutil>=5.9.0               # 系统和进程监控 - 提供系统资源监控功能
+cryptography>=41.0.0        # 加密库 - 提供数据加密和安全验证功能
 
 # 标准库模块（通常不需要单独安装）
 # hashlib, gzip, zipfile, subprocess, pathlib, tempfile, shutil, asyncio, uuid, json, os, re
-
-# 额外的企业级功能依赖
-aiofiles>=23.0.0          # 异步文件操作
-redis>=4.5.0              # 缓存和队列
-sqlalchemy>=2.0.0         # ORM支持
-click>=8.0.0              # 命令行接口
-rich>=13.0.0              # 终端美化输出

@@ -1,6 +1,6 @@
-# MySQL MCP 服务器 (Python企业级版本) 🚀
+# MySQL MCP 服务器  🚀
 
-基于FastMCP框架的企业级MySQL数据库操作服务，为Model Context Protocol (MCP)提供安全、可靠、高性能的MySQL数据库访问服务。完全兼容TypeScript版本的功能和API设计。
+基于FastMCP框架的企业级MySQL数据库操作服务，为Model Context Protocol (MCP)提供安全、可靠、高性能的MySQL数据库访问服务
 
 ## ✨ 企业级功能特性
 

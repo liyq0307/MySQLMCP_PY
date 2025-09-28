@@ -816,15 +816,15 @@ class ErrorHandler:
 
         # 根据严重级别选择日志方法
         if error.severity in [ErrorSeverity.FATAL, ErrorSeverity.CRITICAL]:
-            log_instance.error("Critical error occurred", extra=log_data)
+            log_instance.error("Critical error occurred", metadata=log_data)
         elif error.severity == ErrorSeverity.HIGH:
-            log_instance.warn("High severity error occurred", extra=log_data)
+            log_instance.warn("High severity error occurred", metadata=log_data)
         elif error.severity == ErrorSeverity.MEDIUM:
-            log_instance.warn("Medium severity error occurred", extra=log_data)
+            log_instance.warn("Medium severity error occurred", metadata=log_data)
         elif error.severity == ErrorSeverity.LOW:
-            log_instance.info("Low severity error occurred", extra=log_data)
+            log_instance.info("Low severity error occurred", metadata=log_data)
         else:
-            log_instance.debug("Info level error occurred", extra=log_data)
+            log_instance.debug("Info level error occurred", metadata=log_data)
 
 
 # 便捷函数

@@ -438,6 +438,6 @@ class SecurityLogger:
         # 对于高严重性事件，输出详细信息
         if log_entry.severity in [ErrorSeverity.CRITICAL, ErrorSeverity.HIGH]:
             if log_entry.details:
-                print(f"  Details: {json.dumps(log_entry.details, ensure_ascii=False, indent=2)}")
+                print(f"  Details: {json.dumps(log_entry.details, ensure_ascii=False, indent=2, default=str)}")
             if log_entry.stack_trace:
                 print(f"  Stack Trace: {log_entry.stack_trace}")

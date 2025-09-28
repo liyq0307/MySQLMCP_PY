@@ -1004,7 +1004,7 @@ class SystemMonitor:
 
         # 内存优化建议
         memory_optimization = {
-            'can_optimize': heap_usage > 70 or memory_stats.get('current', {}).get('pressure_level', 0) > 0.7,
+            'can_optimize': heap_usage > 70 or memory_stats['current'].pressure_level > 0.7,
             'potential_savings': f'预计可释放 {(current.memory_usage["heap_total"] - current.memory_usage["heap_used"]) / 1024 / 1024:.2f}MB',
             'last_optimization': gc_stats.last_gc
         }

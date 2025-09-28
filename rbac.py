@@ -5,28 +5,6 @@ RBAC (基于角色的访问控制) 系统 - MySQL MCP权限管理模块
 提供完整的用户、角色、权限管理功能，支持角色继承和权限验证。
 通过RBACManager类实现企业级的访问控制机制。
 
-┌─ 默认配置 ──────────────────────────────────────────────────────────────┐
-│ 👑 内置角色
-│   • admin: 系统管理员，拥有所有权限
-│   • user: 普通用户，拥有查询权限
-│   • editor: 编辑者，拥有CRUD操作权限
-│
-│ 🔑 内置权限
-│   • SELECT: 执行SELECT查询
-│   • INSERT: 执行INSERT操作
-│   • UPDATE: 执行UPDATE操作
-│   • DELETE: 执行DELETE操作
-│   • CREATE: 执行CREATE操作
-│   • DROP: 执行DROP操作
-│   • ALTER: 执行ALTER操作
-│   • SHOW_TABLES: 查看表列表
-│   • DESCRIBE_TABLE: 查看表结构
-│
-│ 👤 默认用户
-│   • admin: 系统管理员用户
-│   • user: 普通用户示例
-└───────────────────────────────────────────────────────────────────────┘
-
 @fileoverview RBAC权限管理系统 - MySQL MCP模块核心组件
 @author liyq
 @version 1.0.0

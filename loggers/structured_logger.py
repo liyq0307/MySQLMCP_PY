@@ -203,15 +203,15 @@ class StructuredLogger:
         """记录信息日志"""
         self.log(LogLevel.INFO, message, category, metadata)
 
-    def warn(self, message: str, category: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
+    def warn(self, message: str, category: Optional[str] = None, context: Optional[Dict[str, Any]] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
         """记录警告日志"""
-        self.log(LogLevel.WARN, message, category, metadata)
+        self.log(LogLevel.WARN, message, category, context, metadata)
 
-    def error(self, message: str, category: Optional[str] = None, error: Optional[Exception] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
+    def error(self, message: str, category: Optional[str] = None, error: Optional[Exception] = None, context: Optional[Dict[str, Any]] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
         """记录错误日志"""
         self.log(LogLevel.ERROR, message, category, metadata, error)
 
-    def fatal(self, message: str, category: Optional[str] = None, error: Optional[Exception] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
+    def fatal(self, message: str, category: Optional[str] = None, error: Optional[Exception] = None, context: Optional[Dict[str, Any]] = None, metadata: Optional[Dict[str, Any]] = None) -> None:
         """记录致命日志"""
         self.log(LogLevel.FATAL, message, category, metadata, error)
 
@@ -220,6 +220,7 @@ class StructuredLogger:
         level: LogLevel,
         message: str,
         category: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         error: Optional[Exception] = None
     ) -> None:
@@ -234,6 +235,7 @@ class StructuredLogger:
             level=level,
             category=category or 'default',
             message=message,
+            context=self._mask_sensitive_fields(context),
             metadata=self._mask_sensitive_fields(metadata),
             request_id=self.config.enable_request_id and self.current_request_id,
             user_id=self.current_user_id,
@@ -322,7 +324,7 @@ class StructuredLogger:
         if entry.span_id:
             data["span_id"] = entry.span_id
 
-        return json.dumps(data, ensure_ascii=False)
+        return json.dumps(data, ensure_ascii=False, default=str)
 
     def _format_text(self, entry: LogEntry) -> str:
         """文本格式化"""
@@ -335,7 +337,7 @@ class StructuredLogger:
         result = f"{timestamp}{level}{category}{entry.message}{error}{context}"
 
         if entry.metadata:
-            result += f" {json.dumps(entry.metadata, ensure_ascii=False)}"
+            result += f" {json.dumps(entry.metadata, ensure_ascii=False, default=str)}"
 
         return result
 
@@ -350,7 +352,7 @@ class StructuredLogger:
         message = f"{timestamp}{level}{category}{entry.message}{error}{context}"
 
         if entry.metadata:
-            message += f" {json.dumps(entry.metadata, ensure_ascii=False, indent=2)}"
+            message += f" {json.dumps(entry.metadata, ensure_ascii=False, indent=2, default=str)}"
 
         return message
 
@@ -381,7 +383,8 @@ class StructuredLogger:
             if output in [LogOutput.FILE, LogOutput.BOTH] and self.file_logger:
                 # 使用Python logging输出到文件
                 log_level = self._convert_log_level(level)
-                self.file_logger.log(log_level, formatted_log)
+                # 避免字符串格式化问题：使用额外参数确保不会将%s等当作格式化字符串
+                self.file_logger.log(log_level, "%s", formatted_log)
 
     def _convert_log_level(self, level: LogLevel) -> int:
         """转换日志级别为Python logging级别"""

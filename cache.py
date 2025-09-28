@@ -427,7 +427,13 @@ class SmartCache(Generic[T]):
                 # 如果命中率低于阈值，触发智能预取
                 total = self.hit_count + self.miss_count
                 if total > 100 and self.hit_count / total < 0.5:
-                    asyncio.create_task(self._perform_prefetch())
+                    try:
+                        # 检查是否有事件循环
+                        loop = asyncio.get_running_loop()
+                        asyncio.create_task(self._perform_prefetch())
+                    except RuntimeError:
+                        # 如果没有事件循环，则跳过预取
+                        pass
                 return None
 
             # 检查条目是否已过期
@@ -552,8 +558,13 @@ class SmartCache(Generic[T]):
             if hasattr(self, 'l2_cache'):
                 self.l2_cache.clear()
 
-            # 清理后触发智能预取分析
-            asyncio.create_task(self._perform_prefetch())
+            # 清理后触发智能预取分析（如果有事件循环）
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.create_task(self._perform_prefetch())
+            except RuntimeError:
+                # 如果没有事件循环，则跳过预取
+                pass
 
     def _evict_lru(self) -> None:
         """淘汰最近最少使用的项目（支持分级缓存L2下沉）"""
@@ -697,9 +708,9 @@ class SmartCache(Generic[T]):
             for key in keys_to_remove:
                 del self.weak_ref_registry[key]
 
-            self.stats['auto_collected_count'] += cleaned_count
-            self.stats['memory_saved'] += memory_reclaimed
-            self.stats['last_cleanup_time'] = TimeUtils.now()
+            self.weak_map_stats['auto_collected_count'] += cleaned_count
+            self.weak_map_stats['memory_saved'] += memory_reclaimed
+            self.weak_map_stats['last_cleanup_time'] = TimeUtils.now()
 
         except Exception as error:
             logger.warn(f"WeakRef cleanup failed: {error}")
@@ -735,7 +746,7 @@ class SmartCache(Generic[T]):
         if new_ttl != self.ttl:
             logger.debug(
                 f"动态调整TTL: {self.ttl}s -> {new_ttl}s (访问率: {access_rate:.4f}/s)",
-                extra={
+                metadata={
                     'access_count': entry.access_count,
                     'access_rate': access_rate,
                     'new_ttl': new_ttl
@@ -783,7 +794,7 @@ class SmartCache(Generic[T]):
 
         logger.debug(
             "分级缓存配置已更新",
-            extra={
+            metadata={
                 'enabled': enabled,
                 'config': self.tiered_cache_config
             }
@@ -818,7 +829,7 @@ class SmartCache(Generic[T]):
 
         logger.debug(
             "TTL动态调整配置已更新",
-            extra={
+            metadata={
                 'enabled': enabled,
                 'config': self.ttl_adjust_config
             }
@@ -873,7 +884,8 @@ class SmartCache(Generic[T]):
 
             logger.info(
                 f"Cache warmup completed: {self.warmup_status['warmed_count']} entries warmed up in {duration}ms",
-                extra={
+                "SmartCache",
+                {
                     'warmed_count': self.warmup_status['warmed_count'],
                     'duration': duration,
                     'cache_size': self.size()
@@ -882,7 +894,9 @@ class SmartCache(Generic[T]):
         except Exception as error:
             logger.error(
                 "Cache warmup failed",
-                extra={'error': str(error)}
+                "SmartCache",
+                error,
+                {'error': str(error)}
             )
             raise error
         finally:
@@ -918,7 +932,7 @@ class SmartCache(Generic[T]):
         if high_freq_keys:
             logger.debug(
                 f"智能预取分析：识别到 {len(high_freq_keys)} 个高频访问键",
-                extra={
+                metadata={
                     'high_freq_keys': high_freq_keys,
                     'threshold': self.prefetch_config['threshold'],
                     'total_accesses': total_accesses
@@ -926,7 +940,12 @@ class SmartCache(Generic[T]):
             )
 
             # 启动异步预取，但不等待完成
-            asyncio.create_task(self._prefetch_data(high_freq_keys))
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.create_task(self._prefetch_data(high_freq_keys))
+            except RuntimeError:
+                # 如果没有事件循环，则跳过预取
+                pass
 
     async def _prefetch_data(self, keys: List[str]) -> None:
         """预取指定键的数据"""
@@ -953,7 +972,7 @@ class SmartCache(Generic[T]):
                         return True
                     return False
                 except Exception as error:
-                    logger.warn(f"预取数据时发生错误: {key}", extra={'error': str(error)})
+                    logger.warn(f"预取数据时发生错误: {key}", "SmartCache", {'error': str(error)})
                     return False
 
             load_promises = [load_single_key(key) for key in keys_to_fetch]
@@ -962,14 +981,14 @@ class SmartCache(Generic[T]):
             success_count = sum(results)
             duration = (time.time() - start_time) * 1000
 
-            logger.debug('智能预取完成', extra={
+            logger.debug('智能预取完成', "SmartCache", {
                 'attempted_keys': len(keys),
                 'fetched_keys': len(keys_to_fetch),
                 'successful_fetches': success_count,
                 'duration': duration
             })
         except Exception as error:
-            logger.warn('智能预取过程中发生错误', extra={'error': str(error)})
+            logger.warn('智能预取过程中发生错误', "SmartCache", {'error': str(error)})
 
     def perform_weak_map_cleanup(self) -> Dict[str, int]:
         """执行WeakMap清理"""
@@ -1192,6 +1211,88 @@ class CacheManager(MemoryPressureObserver):
             if region == CacheRegion.QUERY_RESULT:
                 self.query_cache_stats.current_entries = 0
 
+    def clear_all_sync(self) -> None:
+        """同步清空所有区域的缓存
+
+        执行基本的同步缓存清理，适用于信号处理器等同步上下文。
+        清理统计信息、缓存配置、WeakMap引用等，但不执行需要异步操作的部分。
+        """
+        try:
+            # 清理统计信息
+            for stats in self.global_stats.values():
+                stats['hits'] = 0
+                stats['misses'] = 0
+
+            # 重置查询缓存统计
+            self.query_cache_stats.current_entries = 0
+            self.query_cache_stats.cache_hits = 0
+            self.query_cache_stats.cache_misses = 0
+            self.query_cache_stats.total_queries = 0
+            self.query_cache_stats.skipped_queries = 0
+
+            # 清理每个缓存区域的同步部分
+            for region, cache in self.caches.items():
+                try:
+                    # 同步清理缓存字典（避免使用async clear方法）
+                    if hasattr(cache, 'cache'):
+                        try:
+                            # 直接清理字典，避免async with lock和异步任务
+                            cache.cache.clear()
+                        except Exception:
+                            pass
+
+                    # 清理L2缓存
+                    if hasattr(cache, 'l2_cache'):
+                        try:
+                            cache.l2_cache.clear()
+                        except Exception:
+                            pass
+
+                    # 重置命中统计
+                    if hasattr(cache, 'hit_count'):
+                        cache.hit_count = 0
+                    if hasattr(cache, 'miss_count'):
+                        cache.miss_count = 0
+
+                    # 清理WeakMap相关（如果启用）
+                    if hasattr(cache, 'weak_cache'):
+                        try:
+                            cache.weak_cache = WeakValueDictionary()
+                        except Exception:
+                            pass
+
+                    if hasattr(cache, 'weak_ref_registry'):
+                        try:
+                            cache.weak_ref_registry.clear()
+                        except Exception:
+                            pass
+
+                    # 重置WeakMap统计
+                    if hasattr(cache, 'weak_map_stats'):
+                        cache.weak_map_stats['auto_collected_count'] = 0
+                        cache.weak_map_stats['last_cleanup_time'] = 0
+                        cache.weak_map_stats['memory_saved'] = 0
+
+                except Exception as cache_error:
+                    logger.warn(f"清理缓存区域 {region.value} 时出错: {cache_error}")
+
+            # 执行WeakMap清理
+            try:
+                self.perform_weak_ref_cleanup()
+            except Exception:
+                pass
+
+            # 取消内存压力订阅（如果可能）
+            try:
+                if hasattr(memory_pressure_manager, 'unsubscribe'):
+                    memory_pressure_manager.unsubscribe(self)
+            except Exception:
+                pass
+
+            logger.info("缓存管理器同步清理完成", "CacheManager")
+        except Exception as error:
+            logger.error(f"缓存管理器同步清理失败: {error}")
+
     async def clear_all(self) -> None:
         """清空所有区域的缓存"""
         for cache in self.caches.values():
@@ -1341,7 +1442,7 @@ class CacheManager(MemoryPressureObserver):
 
             logger.debug(
                 f"Invalidated {cleaned_count} query cache entries for table: {table_name}",
-                extra={
+                metadata={
                     'table_name': table_name,
                     'cleaned_count': cleaned_count,
                     'remaining_entries': self.query_cache_stats.current_entries
@@ -1350,7 +1451,7 @@ class CacheManager(MemoryPressureObserver):
         except Exception as error:
             logger.error(
                 f"Error invalidating query cache by table: {table_name}",
-                extra={'error': str(error)}
+                metadata={'error': str(error)}
             )
             # 出错时回退到原来的清空整个缓存区域的实现
             await self.clear_region(CacheRegion.QUERY_RESULT)
@@ -1477,7 +1578,7 @@ class CacheManager(MemoryPressureObserver):
         # 生成参数哈希
         params_hash = ''
         if params:
-            params_str = json.dumps(params, sort_keys=True, separators=(',', ':'))
+            params_str = json.dumps(params, sort_keys=True, separators=(',', ':'), default=str)
             params_hash = hashlib.md5(params_str.encode()).hexdigest()[:8]
 
         # 组合查询和参数
@@ -1596,14 +1697,14 @@ class CacheManager(MemoryPressureObserver):
 
             logger.info(
                 f"Cleaned {cleaned_count} expired query cache entries",
-                extra={
+                metadata={
                     'cleaned_count': cleaned_count,
                     'remaining_entries': self.query_cache_stats.current_entries
                 }
             )
 
         except Exception as error:
-            logger.error("Error during query cache cleanup", extra={'error': str(error)})
+            logger.error("Error during query cache cleanup", "CacheManager", error, {'error': str(error)})
             raise
 
         return cleaned_count
@@ -1710,8 +1811,8 @@ class CacheManager(MemoryPressureObserver):
                 new_cache.miss_count = old_cache.miss_count
 
             # 迁移弱引用统计
-            if hasattr(old_cache, 'stats'):
-                new_cache.stats.update(old_cache.stats)
+            if hasattr(old_cache, 'weak_map_stats'):
+                new_cache.weak_map_stats.update(old_cache.weak_map_stats)
 
             # 迁移其他状态信息
             if hasattr(old_cache, 'warmup_status'):
@@ -1875,8 +1976,14 @@ class CacheManager(MemoryPressureObserver):
         """预热指定区域的缓存"""
         cache = self.caches.get(region)
         if cache:
-            # 使用asyncio创建任务来执行预热
-            asyncio.create_task(cache.warmup(data))
+            # 使用asyncio创建任务来执行预热（如果有事件循环）
+            try:
+                loop = asyncio.get_running_loop()
+                asyncio.create_task(cache.warmup(data))
+            except RuntimeError:
+                # 如果没有事件循环，则跳过预热
+                logger.debug("没有活动的事件循环，跳过缓存预热")
+                pass
 
     def get_cache_config(self, region: CacheRegion) -> Optional[Dict[str, int]]:
         """获取指定区域的缓存配置"""

@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Callable
 import tempfile
 import hashlib
 from dataclasses import dataclass, field
+from pathlib import Path
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill, Font
 
@@ -45,7 +46,7 @@ class MemoryManager:
     """
     高级内存管理器
 
-    基于TypeScript版本的MemoryManager实现，提供完整的内存监控、压力检测和自动清理功能。
+    提供完整的内存监控、压力检测和自动清理功能。
     集成了内存使用跟踪、定时监控、压力回调和智能垃圾回收机制。
 
     主要功能：
@@ -60,6 +61,7 @@ class MemoryManager:
     monitoring_interval: int = 5000  # 5秒检查间隔
     _monitoring_task: Optional[asyncio.Task] = None
     _is_monitoring: bool = False
+    _delayed_monitoring: bool = False
     _memory_pressure_callbacks: List[callable] = field(default_factory=list)
 
     def __post_init__(self):
@@ -79,10 +81,10 @@ class MemoryManager:
         """
         memory_info = MemoryUtils.get_process_memory_info()
         return MemoryUsage(
-            rss=memory_info["rss"],
-            heap_used=memory_info["heap_used"],
-            heap_total=memory_info["heap_total"],
-            external=memory_info["external"],
+            rss=int(memory_info["rss"]),
+            heap_used=int(memory_info["heap_used"]),
+            heap_total=int(memory_info["heap_total"]),
+            external=int(memory_info["external"]),
             array_buffers=0  # Python中暂不实现
         )
 
@@ -153,12 +155,36 @@ class MemoryManager:
             return
 
         self._is_monitoring = True
-        self._monitoring_task = asyncio.create_task(self._monitoring_loop())
 
-        logger.info("内存监控已启用", "MemoryManager", {
-            "interval": f"{self.monitoring_interval}ms",
-            "threshold": f"{self.max_memory_threshold / 1024 / 1024:.1f}MB"
-        })
+        # 检查是否有运行中的事件循环
+        try:
+            loop = asyncio.get_running_loop()
+            self._monitoring_task = asyncio.create_task(self._monitoring_loop())
+            logger.info("内存监控已启用", "MemoryManager", {
+                "interval": f"{self.monitoring_interval}ms",
+                "threshold": f"{self.max_memory_threshold / 1024 / 1024:.1f}MB"
+            })
+        except RuntimeError:
+            # 没有运行的事件循环，标记为延迟启用
+            logger.info("内存监控标记为延迟启用（等待事件循环）", "MemoryManager")
+            self._delayed_monitoring = True
+
+    def start_delayed_monitoring(self) -> None:
+        """
+        启动延迟的内存监控
+
+        当事件循环可用时调用此方法来启动之前延迟的监控。
+        """
+        if self._delayed_monitoring and self._is_monitoring and not self._monitoring_task:
+            try:
+                self._monitoring_task = asyncio.create_task(self._monitoring_loop())
+                self._delayed_monitoring = False
+                logger.info("延迟的内存监控已启动", "MemoryManager", {
+                    "interval": f"{self.monitoring_interval}ms",
+                    "threshold": f"{self.max_memory_threshold / 1024 / 1024:.1f}MB"
+                })
+            except RuntimeError as e:
+                logger.error("启动延迟监控失败", "MemoryManager", {"error": str(e)})
 
     def disable_memory_monitoring(self) -> None:
         """
@@ -353,7 +379,8 @@ class MySQLBackupTool:
         # 初始化内存管理
         self._setup_memory_management()
 
-        # 启动任务调度器
+        # 启动任务调度器（延迟到事件循环可用时）
+        self._scheduler_delayed = False
         self._start_task_scheduler()
 
         # 优化最大并发数
@@ -365,6 +392,23 @@ class MySQLBackupTool:
             'memory_monitoring': True,
             'adaptive_scheduling': True
         })
+
+    def start_delayed_services(self) -> None:
+        """
+        启动延迟的服务
+
+        在事件循环可用时调用此方法来启动内存监控和任务调度器。
+        """
+        # 启动延迟的内存监控
+        self.memory_manager.start_delayed_monitoring()
+
+        # 启动延迟的任务调度器
+        if self._scheduler_delayed and not self.scheduler_running:
+            try:
+                self._start_task_scheduler()
+                self._scheduler_delayed = False
+            except RuntimeError:
+                logger.info("任务调度器仍需等待事件循环", "MySQLBackupTool")
 
     def emit(self, event: str, data: Any = None) -> None:
         """
@@ -1291,14 +1335,21 @@ class MySQLBackupTool:
         if self.scheduler_running:
             return
 
-        self.scheduler_running = True
-        self.scheduler_task = asyncio.create_task(self._task_scheduler_loop())
+        try:
+            loop = asyncio.get_running_loop()
+            self.scheduler_running = True
+            self.scheduler_task = asyncio.create_task(self._task_scheduler_loop())
 
-        # 发出调度器启动事件
-        self.emit('scheduler-started', {
-            'max_concurrent_tasks': self.max_concurrent_tasks,
-            'adaptive_scheduling': True
-        })
+            # 发出调度器启动事件
+            self.emit('scheduler-started', {
+                'max_concurrent_tasks': self.max_concurrent_tasks,
+                'adaptive_scheduling': True
+            })
+        except RuntimeError:
+            # 没有运行的事件循环，标记为延迟启动
+            self.scheduler_running = False
+            self._scheduler_delayed = True
+            logger.info("任务调度器将在事件循环可用时启动", "MySQLBackupTool")
 
     async def _task_scheduler_loop(self) -> None:
         """任务调度器循环 - 改进版自适应调度"""

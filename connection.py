@@ -452,7 +452,7 @@ class ConnectionPool:
             }
         }
 
-        logger.error("紧急告警: 连接池恢复失败", "ConnectionPool", extra=alert_data)
+        logger.error("紧急告警: 连接池恢复失败", "ConnectionPool", None, alert_data)
 
     async def recreate_pool(self, new_connection_limit: int) -> None:
         """重建连接池"""
@@ -874,6 +874,64 @@ class ConnectionPool:
                     return {"affected_rows": cursor.rowcount}
         finally:
             await connection.close()
+
+    def close_sync(self) -> None:
+        """同步关闭连接池
+
+        执行基本的同步清理，适用于信号处理器等同步上下文。
+        包括停止定时任务、清理连接跟踪、保存统计数据等同步操作。
+        """
+        try:
+            self.shutdown_event = True
+
+            # 停止所有定时任务（非阻塞）
+            for task in [self.health_check_interval, self.leak_detection_interval, self.stats_save_interval]:
+                if task and not task.done():
+                    task.cancel()
+
+            # 清理活动连接跟踪
+            try:
+                self.active_connections.clear()
+            except Exception:
+                pass
+
+            # 重置统计信息标记
+            try:
+                self.connection_stats.pool_hits = 0
+                self.connection_stats.pool_waits = 0
+            except Exception:
+                pass
+
+            # 尝试同步保存统计数据（如果可能的话）
+            try:
+                if self.stats_persistence_enabled and hasattr(self, 'stats_file_path'):
+                    import json
+                    import os
+                    from datetime import datetime
+
+                    stats_data = {
+                        'timestamp': datetime.now().isoformat(),
+                        'pool_name': self.config.database,
+                        'shutdown_type': 'sync_cleanup',
+                        'connection_stats': {
+                            'pool_hits': self.connection_stats.pool_hits,
+                            'pool_waits': self.connection_stats.pool_waits,
+                            'total_connections_acquired': self.connection_stats.total_connections_acquired,
+                            'avg_wait_time': self.connection_stats.avg_wait_time,
+                            'max_wait_time': self.connection_stats.max_wait_time
+                        }
+                    }
+
+                    os.makedirs(os.path.dirname(self.stats_file_path), exist_ok=True)
+                    with open(self.stats_file_path, 'w', encoding='utf-8') as f:
+                        json.dump(stats_data, f, indent=2, ensure_ascii=False)
+            except Exception:
+                # 忽略统计数据保存失败
+                pass
+
+            logger.info("连接池同步清理完成", "ConnectionPool")
+        except Exception as error:
+            logger.error(f"连接池同步清理失败: {error}")
 
     async def close(self) -> None:
         """关闭连接池"""

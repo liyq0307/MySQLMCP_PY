@@ -72,7 +72,7 @@ class MySQLImportTool:
         self.session_id = str(uuid.uuid4())
 
         # 初始化缓存管理器
-        self.cache_manager = CacheManager.get_instance()
+        self.cache_manager = mysql_manager.cache_manager
 
         # 注册内存跟踪
         self._register_memory_tracking()
@@ -1317,16 +1317,17 @@ class MySQLImportTool:
         # 首先处理新数据的插入
         if validated_data:
             if options.use_transaction:
-                # 使用事务
+                # 使用批量插入方法而不是批量查询
+                columns = list(validated_data[0].keys())
                 data_rows = [list(row.values()) for row in validated_data]
-                result = await self.mysql_manager.execute_batch_queries([
-                    {
-                        'sql': f'INSERT INTO `{table_name}` ({", ".join(f"`{k}`" for k in validated_data[0].keys())}) VALUES ({", ".join(["%s"] * len(validated_data[0]))})',
-                        'params': data_rows
-                    }
-                ])
-                imported_rows = len(data_rows)
-                batches_processed = 1
+                result = await self.mysql_manager.execute_batch_insert(
+                    table_name,
+                    columns,
+                    data_rows,
+                    batch_size=options.batch_size
+                )
+                imported_rows = result.get('affected_rows', len(data_rows))
+                batches_processed = result.get('batches_processed', 1)
 
                 # 发送事务插入完成进度
                 if options.with_progress:

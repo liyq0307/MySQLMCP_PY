@@ -152,6 +152,7 @@ class MySQLMCPError(Exception):
         original_error: Optional[Exception] = None
     ):
         super().__init__(message)
+        self._message = message  # 内部存储消息
         self.category = category
         self.severity = severity
         self.context = context
@@ -164,6 +165,17 @@ class MySQLMCPError(Exception):
         # 根据错误类别确定是否可恢复和可重试
         self.recoverable = self._is_recoverable(category)
         self.retryable = self._is_retryable(category)
+
+    @property
+    def message(self) -> str:
+        """获取错误消息"""
+        return self._message
+
+    @message.setter
+    def message(self, value: str):
+        """设置错误消息，同时更新Exception的args"""
+        self._message = value
+        self.args = (value,)
 
     def _is_recoverable(self, category: ErrorCategory) -> bool:
         """判断错误是否可恢复"""

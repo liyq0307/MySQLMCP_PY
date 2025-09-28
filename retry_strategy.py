@@ -514,7 +514,7 @@ class SmartRetryStrategy:
             log_data.update(context)
 
         # 使用结构化日志
-        logger.warn("Retry attempt", extra={
+        logger.warn("Retry attempt", "SmartRetryStrategy", {
             "message": log_message,
             "operation_id": operation_id,
             "attempt": attempt,

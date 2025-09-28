@@ -16,9 +16,7 @@ MySQL 高级管理器 - 企业级数据库操作核心
 import asyncio
 import re
 import time
-import uuid
-from typing import Any, Dict, List, Optional, Union, Tuple
-from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 from datetime import datetime
 
 try:
@@ -39,7 +37,7 @@ from security import SecurityValidator
 from rate_limit import AdaptiveRateLimiter
 from metrics import MetricsManager, PerformanceMetrics
 from constants import StringConstants, DefaultConfig
-from retry_strategy import SmartRetryStrategy
+from retry_strategy import SmartRetryStrategy, RetryStrategy
 from tool_wrapper import with_error_handling, with_performance_monitoring
 from type_utils import (
     ErrorCategory,
@@ -92,6 +90,9 @@ class MySQLManager:
         # 生成用于跟踪的唯一会话标识符
         self.session_id = IdUtils.generate_uuid()
 
+        # 标记是否需要延迟初始化缓存预热
+        self._delayed_cache_warmup = False
+
         # 初始化集中配置管理
         self.config_manager = ConfigurationManager()
 
@@ -111,10 +112,12 @@ class MySQLManager:
 
         # 执行初始化缓存预热（仅在有事件循环时）
         try:
+            loop = asyncio.get_running_loop()
             asyncio.create_task(self.initialize_cache_warmup())
         except RuntimeError:
-            # 如果没有运行的事件循环，稍后手动初始化
-            pass
+            # 如果没有运行的事件循环，标记为延迟初始化
+            self._delayed_cache_warmup = True
+            logger.info("缓存预热标记为延迟启用（等待事件循环）", "MySQLManager")
 
         # 初始化性能监控系统
         self.metrics = PerformanceMetrics()
@@ -259,17 +262,17 @@ class MySQLManager:
                     table,
                     # 加载表结构
                     lambda: self.execute_query(
-                        "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                        "SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_DEFAULT, COLUMN_KEY FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
                         [schema, table]
                     ),
                     # 检查表是否存在
                     lambda: self.execute_query(
-                        "SELECT COUNT(*) as count FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                        "SELECT COUNT(*) as count FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
                         [schema, table]
                     ),
                     # 加载索引信息
                     lambda: self.execute_query(
-                        "SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+                        "SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s",
                         [schema, table]
                     )
                 )
@@ -311,6 +314,20 @@ class MySQLManager:
             logger.error('缓存预热过程中发生错误', 'MySQLManager', error)
             raise
 
+    def start_delayed_cache_warmup(self) -> None:
+        """
+        启动延迟的缓存预热
+
+        当事件循环可用时调用此方法来启动之前延迟的缓存预热。
+        """
+        if self._delayed_cache_warmup:
+            try:
+                asyncio.create_task(self.initialize_cache_warmup())
+                self._delayed_cache_warmup = False
+                logger.info("延迟的缓存预热已启动", "MySQLManager")
+            except RuntimeError as e:
+                logger.error("启动延迟缓存预热失败", "MySQLManager", {"error": str(e)})
+
     async def execute_with_smart_retry(
         self,
         operation,
@@ -334,7 +351,7 @@ class MySQLManager:
             'operation': operation_name,
             'session_id': self.session_id,
             'user_id': context.get('table', 'unknown') if context else 'unknown',
-            'timestamp': datetime.now(),
+            'timestamp': datetime.now().isoformat(),
             'metadata': {
                 'table': context.get('table') if context else None,
                 'query_type': context.get('query', '').split(' ')[0].upper() if context and context.get('query') else None,
@@ -342,15 +359,17 @@ class MySQLManager:
         }
 
         # 使用智能重试策略执行操作
+        custom_strategy = RetryStrategy(
+            max_attempts=getattr(DefaultConfig, 'MAX_RETRY_ATTEMPTS', 3),
+            base_delay=1000,
+            max_delay=30000,
+            backoff_multiplier=2,
+            jitter=True
+        )
+
         result = await self.smart_retry_manager.execute_with_retry(
             operation,
-            {
-                'max_attempts': DefaultConfig.get('MAX_RETRY_ATTEMPTS', 3),
-                'base_delay': 1000,
-                'max_delay': 30000,
-                'backoff_multiplier': 2,
-                'jitter': True
-            },
+            custom_strategy,
             error_context
         )
 
@@ -404,7 +423,7 @@ class MySQLManager:
         """
         if len(query) > self.config_manager.security.max_query_length:
             error = MySQLMCPError(
-                StringConstants.get('MSG_QUERY_TOO_LONG'),
+                StringConstants.MSG_QUERY_TOO_LONG,
                 ErrorCategory.SYNTAX_ERROR,
                 ErrorSeverity.HIGH
             )
@@ -420,18 +439,18 @@ class MySQLManager:
                     None   # user_id需要从请求上下文中获取
                 )
                 error = MySQLMCPError(
-                    StringConstants.get('MSG_PROHIBITED_OPERATIONS'),
-                    ErrorCategory.SECURITY_ERROR,
+                    StringConstants.MSG_PROHIBITED_OPERATIONS,
+                    ErrorCategory.SECURITY_VIOLATION,
                     ErrorSeverity.HIGH
                 )
                 safe_error = ErrorHandler.safe_error(error, 'validate_query')
-                raise MySQLMCPError(safe_error.message, ErrorCategory.SECURITY_ERROR, ErrorSeverity.HIGH)
+                raise MySQLMCPError(safe_error.message, ErrorCategory.SECURITY_VIOLATION, ErrorSeverity.HIGH)
 
         threat_analysis = SecurityValidator.analyze_security_threats(query)
-        if threat_analysis and threat_analysis.threats:
+        if threat_analysis and threat_analysis.get('threats'):
             injection_threats = [
-                t.pattern_id for t in threat_analysis.threats
-                if t.type == 'SQL_INJECTION'
+                t['pattern_id'] for t in threat_analysis['threats']
+                if t['type'] == 'SQL_INJECTION'
             ]
 
             if injection_threats:
@@ -443,19 +462,19 @@ class MySQLManager:
                 )
 
             error = MySQLMCPError(
-                StringConstants.get('MSG_PROHIBITED_OPERATIONS'),
-                ErrorCategory.SECURITY_ERROR,
+                StringConstants.MSG_PROHIBITED_OPERATIONS,
+                ErrorCategory.SECURITY_VIOLATION,
                 ErrorSeverity.HIGH
             )
             safe_error = ErrorHandler.safe_error(error, 'validate_query')
-            raise MySQLMCPError(safe_error.message, ErrorCategory.SECURITY_ERROR, ErrorSeverity.HIGH)
+            raise MySQLMCPError(safe_error.message, ErrorCategory.SECURITY_VIOLATION, ErrorSeverity.HIGH)
 
         trimmed_query = query.strip()
         query_type_match = re.match(r'^(\w+)', trimmed_query)
         query_type = query_type_match.group(1).upper() if query_type_match else ''
 
         if not query_type or query_type not in self.config_manager.security.allowed_query_types:
-            error_msg = StringConstants.get('MSG_QUERY_TYPE_NOT_ALLOWED').format(query_type=query_type)
+            error_msg = StringConstants.MSG_QUERY_TYPE_NOT_ALLOWED.format(query_type=query_type)
             error = MySQLMCPError(
                 error_msg,
                 ErrorCategory.SYNTAX_ERROR,
@@ -476,16 +495,16 @@ class MySQLManager:
         """
         if not self.table_name_pattern.match(table_name):
             error = MySQLMCPError(
-                StringConstants.get('MSG_INVALID_TABLE_NAME'),
+                StringConstants.MSG_INVALID_TABLE_NAME,
                 ErrorCategory.VALIDATION_ERROR,
                 ErrorSeverity.MEDIUM
             )
             safe_error = ErrorHandler.safe_error(error, 'validate_table_name')
             raise MySQLMCPError(safe_error.message, ErrorCategory.VALIDATION_ERROR, ErrorSeverity.MEDIUM)
 
-        if len(table_name) > DefaultConfig.get('MAX_TABLE_NAME_LENGTH', 64):
+        if len(table_name) > getattr(DefaultConfig, 'MAX_TABLE_NAME_LENGTH', 64):
             error = MySQLMCPError(
-                StringConstants.get('MSG_TABLE_NAME_TOO_LONG'),
+                StringConstants.MSG_TABLE_NAME_TOO_LONG,
                 ErrorCategory.VALIDATION_ERROR,
                 ErrorSeverity.MEDIUM
             )
@@ -510,7 +529,7 @@ class MySQLManager:
             )
 
             error = MySQLMCPError(
-                StringConstants.get('MSG_RATE_LIMIT_EXCEEDED'),
+                StringConstants.MSG_RATE_LIMIT_EXCEEDED,
                 ErrorCategory.RATE_LIMIT_ERROR,
                 ErrorSeverity.MEDIUM
             )
@@ -548,7 +567,7 @@ class MySQLManager:
                   EXTRA,
                   COLUMN_COMMENT
                 FROM INFORMATION_SCHEMA.COLUMNS
-                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s
                 ORDER BY ORDINAL_POSITION
             """
 
@@ -578,7 +597,7 @@ class MySQLManager:
             exists_query = """
                 SELECT COUNT(*) as count
                 FROM INFORMATION_SCHEMA.TABLES
-                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+                WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s
             """
 
             query_result = await self.execute_query(exists_query, [table_name])
@@ -626,7 +645,7 @@ class MySQLManager:
             # 尝试从查询缓存获取结果
             cached_result = await self.cache_manager.get_cached_query(query, params)
             if cached_result is not None:
-                query_time = timer.get_elapsed()
+                query_time = timer.get('get_elapsed', lambda: 0)() if isinstance(timer, dict) else 0
                 self.update_metrics(query_time, False, False)
 
                 logger.info('查询缓存命中', 'MySQLManager', {
@@ -638,8 +657,11 @@ class MySQLManager:
                 return cached_result
 
             # 在瞬态故障时自动重试执行（使用智能重试策略）
+            async def query_operation():
+                return await self.execute_query_internal(query, params)
+
             result = await self.execute_with_smart_retry(
-                lambda: self.execute_query_internal(query, params),
+                query_operation,
                 'execute_query',
                 {
                     'query': query.split(' ')[0].upper() if query.strip() else '',
@@ -648,10 +670,14 @@ class MySQLManager:
             )
 
             # 异步缓存查询结果（不阻塞响应）
-            asyncio.create_task(self.cache_manager.set_cached_query(query, params, result))
+            try:
+                asyncio.create_task(self.cache_manager.set_cached_query(query, params, result))
+            except RuntimeError:
+                # 如果没有事件循环，则跳过异步缓存
+                pass
 
-            query_time = timer.get_elapsed()
-            is_slow = query_time > DefaultConfig.get('SLOW_QUERY_THRESHOLD', 1.0)
+            query_time = timer.get('get_elapsed', lambda: 0)() if isinstance(timer, dict) else 0
+            is_slow = query_time > getattr(DefaultConfig, 'SLOW_QUERY_THRESHOLD', 1.0)
             self.update_metrics(query_time, False, is_slow)
 
             logger.info('查询执行成功', 'MySQLManager', {
@@ -663,7 +689,7 @@ class MySQLManager:
             return result
 
         except Exception as error:
-            query_time = timer.get_elapsed()
+            query_time = timer.get('get_elapsed', lambda: 0)() if isinstance(timer, dict) else 0
             self.update_metrics(query_time, True, False)
 
             logger.error('查询执行失败', 'MySQLManager', error, {
@@ -695,6 +721,17 @@ class MySQLManager:
 
         try:
             async with connection.cursor() as cursor:
+                # 防御性参数验证：检查参数数量与查询中的占位符数量是否匹配
+                if params is not None:
+                    placeholder_count = query.count('%s')
+                    param_count = len(params)
+                    if placeholder_count != param_count:
+                        raise MySQLMCPError(
+                            f"参数数量不匹配：查询包含 {placeholder_count} 个占位符，但提供了 {param_count} 个参数",
+                            ErrorCategory.SYNTAX_ERROR,
+                            ErrorSeverity.HIGH
+                        )
+
                 await cursor.execute(query, params)
                 if query.strip().upper().startswith(('SELECT', 'SHOW', 'DESCRIBE')):
                     result = await cursor.fetchall()
@@ -782,9 +819,9 @@ class MySQLManager:
         @returns 包含详细性能指标的对象
         """
         return {
-            StringConstants.get('SECTION_PERFORMANCE'): self.metrics.to_object(),
-            StringConstants.get('SECTION_CACHE_STATS'): self.cache_manager.get_all_stats(),
-            StringConstants.get('SECTION_CONNECTION_POOL'): self.connection_pool.get_stats(),
+            StringConstants.SECTION_PERFORMANCE: self.metrics.to_object(),
+            StringConstants.SECTION_CACHE_STATS: self.cache_manager.get_all_stats(),
+            StringConstants.SECTION_CONNECTION_POOL: self.connection_pool.get_stats() if self.connection_pool else None,
             'smart_retry_stats': self.smart_retry_manager.get_retry_stats(),
             'query_cache_stats': self.cache_manager.get_query_cache_stats()
         }
@@ -857,7 +894,7 @@ class MySQLManager:
         try:
             pressure_level = memory_pressure_manager.get_current_pressure()
             scale_factor = max(0.1, 1 - pressure_level)
-            base_batch_size = DefaultConfig.get('BATCH_SIZE', 1000)
+            base_batch_size = getattr(DefaultConfig, 'BATCH_SIZE', 1000)
             optimal_batch_size = max(10, int(base_batch_size * scale_factor))
 
             if data_size > 10000:
@@ -866,7 +903,7 @@ class MySQLManager:
             return max(10, min(optimal_batch_size, 5000))
         except Exception as error:
             logger.warn('Failed to calculate optimal batch size:', 'MySQLManager', {'error': str(error)})
-            return DefaultConfig.get('BATCH_SIZE', 1000)
+            return getattr(DefaultConfig, 'BATCH_SIZE', 1000)
 
     def get_smart_cache(self, region: CacheRegion):
         """获取智能缓存实例用于特定用途
@@ -1096,7 +1133,7 @@ class MySQLManager:
             return {
                 'affected_rows': 0,
                 'batches_processed': 0,
-                'batch_size': batch_size or DefaultConfig.get('BATCH_SIZE', 1000),
+                'batch_size': batch_size or getattr(DefaultConfig, 'BATCH_SIZE', 1000),
                 'total_rows_processed': 0
             }
 
@@ -1163,8 +1200,8 @@ class MySQLManager:
                     connection.close()
 
             # 记录性能指标
-            query_time = timer.get_elapsed()
-            is_slow = query_time > DefaultConfig.get('SLOW_QUERY_THRESHOLD', 1.0)
+            query_time = timer.get('get_elapsed', lambda: 0)() if isinstance(timer, dict) else 0
+            is_slow = query_time > getattr(DefaultConfig, 'SLOW_QUERY_THRESHOLD', 1.0)
             self.update_metrics(query_time, False, is_slow)
 
             # 成功插入后，失效相关缓存
@@ -1178,7 +1215,7 @@ class MySQLManager:
             }
 
         except Exception as error:
-            query_time = timer.get_elapsed()
+            query_time = timer.get('get_elapsed', lambda: 0)() if isinstance(timer, dict) else 0
             self.update_metrics(query_time, True, False)
             raise
 
@@ -1315,7 +1352,11 @@ class MySQLManager:
         """
         cache = self.cache_manager.get_cache_instance(region)
         if cache:
-            asyncio.create_task(cache.warmup(data))
+            try:
+                asyncio.create_task(cache.warmup(data))
+            except RuntimeError:
+                # 如果没有事件循环，则跳过预热
+                logger.debug("没有活动的事件循环，跳过缓存预热")
 
     def get_cache_config(self, region: CacheRegion) -> Optional[Dict[str, int]]:
         """获取指定区域的缓存配置
@@ -1349,6 +1390,85 @@ class MySQLManager:
             'performance_metrics': self.get_performance_metrics()
         }
 
+    def cleanup_sync(self) -> None:
+        """同步清理MySQL管理器
+
+        执行同步的清理操作，适用于信号处理器等同步上下文。
+        包括连接池、缓存、指标监控等所有组件的基本清理操作。
+
+        @public
+        """
+        try:
+            # 停止增强指标监控
+            if hasattr(self, 'enhanced_metrics'):
+                try:
+                    self.enhanced_metrics.stop_monitoring()
+                except Exception:
+                    pass
+
+            # 同步清理连接池（如果存在）
+            if hasattr(self, 'connection_pool') and self.connection_pool:
+                try:
+                    self.connection_pool.close_sync()
+                except Exception as error:
+                    logger.warn(f"连接池同步清理失败: {error}")
+
+            # 同步清理缓存管理器
+            if hasattr(self, 'cache_manager'):
+                try:
+                    self.cache_manager.clear_all_sync()
+                except Exception as error:
+                    logger.warn(f"缓存管理器同步清理失败: {error}")
+
+            # 清理性能指标
+            if hasattr(self, 'metrics'):
+                try:
+                    self.metrics.query_count = 0
+                    self.metrics.error_count = 0
+                    self.metrics.slow_query_count = 0
+                    self.metrics.total_query_time = 0
+                    self.metrics.cache_hits = 0
+                    self.metrics.cache_misses = 0
+                except Exception:
+                    pass
+
+            # 重置状态标志
+            try:
+                self._delayed_cache_warmup = False
+                self.last_memory_cleanup_time = 0
+            except Exception:
+                pass
+
+            # 取消注册跟踪的对象
+            try:
+                memory_monitor.unregister_object('mysql_manager_session')
+                memory_monitor.unregister_object('connection_pool')
+                memory_monitor.unregister_object('cache_manager')
+                memory_monitor.unregister_object('metrics_manager')
+            except Exception:
+                # 忽略取消注册失败
+                pass
+
+            # 清理速率限制器状态
+            if hasattr(self, 'adaptive_rate_limiter'):
+                try:
+                    # 重置速率限制器的内部状态（如果有相关方法）
+                    pass
+                except Exception:
+                    pass
+
+            # 清理RBAC管理器状态
+            if hasattr(self, 'rbac'):
+                try:
+                    # 清理RBAC状态（如果需要）
+                    pass
+                except Exception:
+                    pass
+
+            logger.info("MySQL管理器同步清理完成", "MySQLManager")
+        except Exception as error:
+            logger.error(f"{StringConstants.MSG_ERROR_DURING_CLEANUP}", 'MySQLManager', error)
+
     async def close(self) -> None:
         """关闭MySQL管理器
 
@@ -1377,7 +1497,7 @@ class MySQLManager:
             # 清除所有缓存以释放内存
             await self.cache_manager.clear_all()
         except Exception as error:
-            logger.error(f"{StringConstants.get('MSG_ERROR_DURING_CLEANUP')}", 'MySQLManager', error)
+            logger.error(f"{StringConstants.MSG_ERROR_DURING_CLEANUP}", 'MySQLManager', error)
 
 
 # 全局MySQL管理器实例
