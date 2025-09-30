@@ -283,24 +283,51 @@ class SlowQueryAnalysisModule:
             # 检查performance_schema是否启用
             await self._check_performance_schema()
 
+            # 检查列可用性
+            column_availability = await self._check_column_availability()
+
             # 构建时间范围条件
             time_filter = self._build_time_filter(time_range)
+
+            # 基础查询列（这些在大部分版本中都有）
+            base_columns = [
+                "DIGEST_TEXT as sql_text",
+                "COUNT_STAR as execution_count",
+                "SUM_TIMER_WAIT / 1000000000 as total_time_sec",
+                "AVG_TIMER_WAIT / 1000000000 as avg_time_sec",
+                "MAX_TIMER_WAIT / 1000000000 as max_time_sec",
+                "FIRST_SEEN as first_seen",
+                "LAST_SEEN as last_seen",
+                "SCHEMA_NAME as database_name",
+                "DIGEST as query_digest"
+            ]
+
+            # 根据列可用性添加额外列
+            optional_columns = []
+            if column_availability.get('SUM_ROWS_EXAMINED', False):
+                optional_columns.append("SUM_ROWS_EXAMINED as total_rows_examined")
+            else:
+                optional_columns.append("0 as total_rows_examined")
+
+            if column_availability.get('SUM_ROWS_SENT', False):
+                optional_columns.append("SUM_ROWS_SENT as total_rows_sent")
+            else:
+                optional_columns.append("0 as total_rows_sent")
+
+            if column_availability.get('SUM_NO_INDEX_USED', False) and column_availability.get('SUM_NO_GOOD_INDEX_USED', False):
+                optional_columns.append("SUM_NO_INDEX_USED + SUM_NO_GOOD_INDEX_USED as queries_without_index")
+            elif column_availability.get('SUM_NO_INDEX_USED', False):
+                optional_columns.append("SUM_NO_INDEX_USED as queries_without_index")
+            else:
+                optional_columns.append("0 as queries_without_index")
+
+            # 组合所有列
+            all_columns = base_columns + optional_columns
 
             # 查询慢查询统计信息
             query = f"""
                 SELECT
-                    DIGEST_TEXT as sql_text,
-                    COUNT_STAR as execution_count,
-                    SUM_TIMER_WAIT / 1000000000 as total_time_sec,
-                    AVG_TIMER_WAIT / 1000000000 as avg_time_sec,
-                    MAX_TIMER_WAIT / 1000000000 as max_time_sec,
-                    FIRST_SEEN as first_seen,
-                    LAST_SEEN as last_seen,
-                    SCHEMA_NAME as database_name,
-                    SUM_ROWS_EXAMINED as total_rows_examined,
-                    SUM_ROWS_SENT as total_rows_sent,
-                    SUM_NO_INDEX_USED + SUM_NO_GOOD_INDEX_USED as queries_without_index,
-                    DIGEST as query_digest
+                    {', '.join(all_columns)}
                 FROM performance_schema.events_statements_summary_by_digest
                 WHERE
                     SCHEMA_NAME IS NOT NULL
@@ -323,8 +350,8 @@ class SlowQueryAnalysisModule:
                     sql_text=row.get('sql_text', ''),
                     execution_time=row.get('avg_time_sec', 0),
                     lock_time=0,
-                    rows_examined=int(row.get('total_rows_examined', 0) / max(row.get('execution_count', 1), 1)),
-                    rows_returned=int(row.get('total_rows_sent', 0) / max(row.get('execution_count', 1), 1)),
+                    rows_examined=self._safe_int_convert(row.get('total_rows_examined', 0) / max(row.get('execution_count', 1), 1)),
+                    rows_returned=self._safe_int_convert(row.get('total_rows_sent', 0) / max(row.get('execution_count', 1), 1)),
                     start_time=datetime.now(),
                     user='N/A',
                     database=row.get('database_name', 'unknown'),
@@ -426,6 +453,34 @@ class SlowQueryAnalysisModule:
                 ErrorCategory.CONFIGURATION_ERROR,
                 ErrorSeverity.MEDIUM
             )
+
+    async def _check_column_availability(self) -> Dict[str, bool]:
+        """检查性能模式表中的列是否可用"""
+        try:
+            # 检查events_statements_summary_by_digest表中的列
+            result = await self.mysql_manager.execute_query("""
+                SELECT COLUMN_NAME
+                FROM information_schema.COLUMNS
+                WHERE TABLE_SCHEMA = 'performance_schema'
+                AND TABLE_NAME = 'events_statements_summary_by_digest'
+            """)
+
+            available_columns = {row['COLUMN_NAME'] for row in result} if result else set()
+
+            return {
+                'SUM_ROWS_EXAMINED': 'SUM_ROWS_EXAMINED' in available_columns,
+                'SUM_ROWS_SENT': 'SUM_ROWS_SENT' in available_columns,
+                'SUM_NO_INDEX_USED': 'SUM_NO_INDEX_USED' in available_columns,
+                'SUM_NO_GOOD_INDEX_USED': 'SUM_NO_GOOD_INDEX_USED' in available_columns
+            }
+        except Exception as e:
+            # 如果检查失败，假设所有列都不可用（向后兼容）
+            return {
+                'SUM_ROWS_EXAMINED': False,
+                'SUM_ROWS_SENT': False,
+                'SUM_NO_INDEX_USED': False,
+                'SUM_NO_GOOD_INDEX_USED': False
+            }
 
     def _build_time_filter(self, time_range: str) -> str:
         """构建时间范围过滤条件"""
@@ -1258,7 +1313,7 @@ class ReportingModule:
                 return '0.0%'
 
             # 将状态结果转换为字典
-            cache_stats = {row['Variable_name']: int(row.get('Value', 0)) for row in cache_result}
+            cache_stats = {row['Variable_name']: self._safe_int_convert(row.get('Value', 0)) for row in cache_result}
 
             hits = cache_stats.get('Qcache_hits', 0)
             inserts = cache_stats.get('Qcache_inserts', 0)
@@ -1292,7 +1347,7 @@ class ReportingModule:
                 return 'N/A'
 
             # 将状态结果转换为字典
-            innodb_stats = {row['Variable_name']: int(row.get('Value', 0)) for row in innodb_result}
+            innodb_stats = {row['Variable_name']: self._safe_int_convert(row.get('Value', 0)) for row in innodb_result}
 
             buffer_reads = innodb_stats.get('Innodb_buffer_pool_reads', 0)
             read_requests = innodb_stats.get('Innodb_buffer_pool_read_requests', 0)
@@ -1380,6 +1435,32 @@ class PerformanceManager:
         self.query_profiling = QueryProfilingModule(mysql_manager)
         self.performance_monitoring = PerformanceMonitoringModule(mysql_manager, self.config)
         self.reporting = ReportingModule(mysql_manager, self.config)
+
+    def _safe_int_convert(self, value: Any) -> int:
+        """
+        安全地将值转换为整数
+
+        Args:
+            value: 要转换的值
+
+        Returns:
+            转换后的整数值，转换失败时返回0
+        """
+        try:
+            if value is None:
+                return 0
+            if isinstance(value, (int, float)):
+                return int(value)
+            if isinstance(value, str):
+                if value.isdigit():
+                    return int(value)
+                try:
+                    return int(float(value))
+                except (ValueError, TypeError):
+                    return 0
+            return 0
+        except (ValueError, TypeError, OverflowError):
+            return 0
 
     async def configure_slow_query_log(self, long_query_time: float = 1.0) -> None:
         """

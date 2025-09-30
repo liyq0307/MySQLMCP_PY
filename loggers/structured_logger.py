@@ -379,12 +379,25 @@ class StructuredLogger:
 
         for output in outputs:
             if output in [LogOutput.CONSOLE, LogOutput.BOTH]:
-                print(formatted_log)
+                try:
+                    print(formatted_log)
+                except (OSError, IOError, ValueError) as e:
+                    # 如果控制台输出失败，忽略错误
+                    pass
+
             if output in [LogOutput.FILE, LogOutput.BOTH] and self.file_logger:
-                # 使用Python logging输出到文件
-                log_level = self._convert_log_level(level)
-                # 避免字符串格式化问题：使用额外参数确保不会将%s等当作格式化字符串
-                self.file_logger.log(log_level, "%s", formatted_log)
+                try:
+                    # 使用Python logging输出到文件
+                    log_level = self._convert_log_level(level)
+                    # 避免字符串格式化问题：使用额外参数确保不会将%s等当作格式化字符串
+                    self.file_logger.log(log_level, "%s", formatted_log)
+                except (OSError, IOError, ValueError) as e:
+                    # 如果文件输出失败，忽略错误并尝试回退到控制台
+                    try:
+                        print(f"File logging failed: {e}, falling back to console: {formatted_log}")
+                    except (OSError, IOError, ValueError):
+                        # 所有输出都失败，静默忽略
+                        pass
 
     def _convert_log_level(self, level: LogLevel) -> int:
         """转换日志级别为Python logging级别"""

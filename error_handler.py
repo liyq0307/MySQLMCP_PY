@@ -3,18 +3,25 @@ MySQL MCP 错误处理与智能分析系统
 
 为Model Context Protocol (MCP)提供安全、可靠的错误处理服务。
 集成完整的错误分类、分析和恢复建议功能。
+整合自动错误恢复、重试机制和熔断器模式。
 
 基于TypeScript版本的完整Python实现，保持功能一致性和API兼容性。
 
 @version 1.0.0
 @since 1.0.0
-@updated 2025-09-25
+@updated 2025-09-30 - 整合 error_recovery 功能
 @license MIT
 """
 
 import re
-from typing import Dict, Any, Optional, Union
-from datetime import datetime
+import asyncio
+import time
+import random
+from typing import Dict, Any, Optional, Union, Callable, Awaitable, List
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from enum import Enum
+from collections import defaultdict, deque
 
 from type_utils import (
     MySQLMCPError, ErrorCategory, ErrorSeverity, ErrorContext
@@ -861,3 +868,678 @@ def analyze_error(error: Exception, operation: Optional[str] = None) -> Dict[str
         错误分析结果
     """
     return ErrorHandler.analyze_error(error, operation)
+
+
+# =============================================================================
+# 错误恢复机制 - 整合自 error_recovery.py
+# =============================================================================
+
+class ErrorType(Enum):
+    """错误类型枚举（用于恢复机制）"""
+    CONNECTION_ERROR = "connection_error"
+    TIMEOUT_ERROR = "timeout_error"
+    SYNTAX_ERROR = "syntax_error"
+    PERMISSION_ERROR = "permission_error"
+    RESOURCE_ERROR = "resource_error"
+    DATA_ERROR = "data_error"
+    NETWORK_ERROR = "network_error"
+    SYSTEM_ERROR = "system_error"
+    UNKNOWN_ERROR = "unknown_error"
+
+
+class RecoveryStrategy(Enum):
+    """恢复策略枚举"""
+    IMMEDIATE_RETRY = "immediate_retry"
+    EXPONENTIAL_BACKOFF = "exponential_backoff"
+    LINEAR_BACKOFF = "linear_backoff"
+    FALLBACK_OPERATION = "fallback_operation"
+    CIRCUIT_BREAKER = "circuit_breaker"
+    GRACEFUL_DEGRADATION = "graceful_degradation"
+    MANUAL_INTERVENTION = "manual_intervention"
+
+
+class RecoveryPriority(Enum):
+    """恢复优先级"""
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+
+
+@dataclass
+class RecoveryRule:
+    """恢复规则定义"""
+    name: str
+    error_patterns: List[str]
+    error_types: List[ErrorType]
+    strategy: RecoveryStrategy
+    max_attempts: int
+    base_delay: float
+    max_delay: float
+    backoff_multiplier: float
+    success_threshold: float
+    circuit_breaker_threshold: int
+    priority: RecoveryPriority
+    fallback_operations: List[str]
+    conditions: Dict[str, Any]
+    enabled: bool = True
+
+
+@dataclass
+class RecoveryAttempt:
+    """恢复尝试记录"""
+    attempt_id: str
+    rule_name: str
+    strategy: RecoveryStrategy
+    delay: float
+    timestamp: datetime
+    success: bool
+    error: Optional[str] = None
+    duration: float = 0.0
+    metadata: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class RecoveryResult:
+    """恢复结果"""
+    success: bool
+    attempts_used: int
+    total_duration: float
+    final_error: Optional[str]
+    recovery_strategy_used: Optional[RecoveryStrategy]
+    attempts: List[RecoveryAttempt]
+    metadata: Dict[str, Any]
+
+
+class CircuitBreakerState(Enum):
+    """熔断器状态"""
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+@dataclass
+class CircuitBreaker:
+    """熔断器实现"""
+    name: str
+    failure_threshold: int
+    success_threshold: int
+    timeout: float
+    state: CircuitBreakerState = CircuitBreakerState.CLOSED
+    failure_count: int = 0
+    success_count: int = 0
+    last_failure_time: Optional[datetime] = None
+    state_change_time: datetime = None
+
+    def __post_init__(self):
+        if self.state_change_time is None:
+            self.state_change_time = datetime.now()
+
+    def should_allow_request(self) -> bool:
+        """判断是否允许请求"""
+        now = datetime.now()
+
+        if self.state == CircuitBreakerState.CLOSED:
+            return True
+        elif self.state == CircuitBreakerState.OPEN:
+            if self.last_failure_time and (now - self.last_failure_time).total_seconds() > self.timeout:
+                self.state = CircuitBreakerState.HALF_OPEN
+                self.state_change_time = now
+                return True
+            return False
+        elif self.state == CircuitBreakerState.HALF_OPEN:
+            return True
+
+        return False
+
+    def record_success(self):
+        """记录成功"""
+        if self.state == CircuitBreakerState.HALF_OPEN:
+            self.success_count += 1
+            if self.success_count >= self.success_threshold:
+                self.state = CircuitBreakerState.CLOSED
+                self.failure_count = 0
+                self.success_count = 0
+                self.state_change_time = datetime.now()
+        elif self.state == CircuitBreakerState.CLOSED:
+            self.failure_count = 0
+
+    def record_failure(self):
+        """记录失败"""
+        self.failure_count += 1
+        self.last_failure_time = datetime.now()
+
+        if self.state == CircuitBreakerState.CLOSED:
+            if self.failure_count >= self.failure_threshold:
+                self.state = CircuitBreakerState.OPEN
+                self.state_change_time = datetime.now()
+        elif self.state == CircuitBreakerState.HALF_OPEN:
+            self.state = CircuitBreakerState.OPEN
+            self.success_count = 0
+            self.state_change_time = datetime.now()
+
+
+class ErrorRecoveryManager:
+    """错误恢复管理器
+
+    提供自动重试、熔断器模式、错误恢复策略等企业级容错机制。
+    """
+
+    def __init__(self):
+        self.recovery_rules: Dict[str, RecoveryRule] = {}
+        self.circuit_breakers: Dict[str, CircuitBreaker] = {}
+        self.error_history: deque = deque(maxlen=1000)
+        self.recovery_statistics: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        self.active_recoveries: Dict[str, Any] = {}
+        self._lock = asyncio.Lock()
+
+        # 初始化默认恢复规则
+        self._initialize_default_rules()
+
+    def _initialize_default_rules(self):
+        """初始化默认恢复规则"""
+        default_rules = [
+            RecoveryRule(
+                name="connection_retry",
+                error_patterns=["connection", "connect", "timeout"],
+                error_types=[ErrorType.CONNECTION_ERROR, ErrorType.TIMEOUT_ERROR, ErrorType.NETWORK_ERROR],
+                strategy=RecoveryStrategy.EXPONENTIAL_BACKOFF,
+                max_attempts=5,
+                base_delay=1.0,
+                max_delay=30.0,
+                backoff_multiplier=2.0,
+                success_threshold=0.8,
+                circuit_breaker_threshold=10,
+                priority=RecoveryPriority.HIGH,
+                fallback_operations=["use_backup_connection", "switch_to_readonly"],
+                conditions={"max_concurrent_recoveries": 3}
+            ),
+            RecoveryRule(
+                name="resource_exhaustion_recovery",
+                error_patterns=["memory", "disk", "too many connections"],
+                error_types=[ErrorType.RESOURCE_ERROR],
+                strategy=RecoveryStrategy.GRACEFUL_DEGRADATION,
+                max_attempts=3,
+                base_delay=5.0,
+                max_delay=60.0,
+                backoff_multiplier=1.5,
+                success_threshold=0.7,
+                circuit_breaker_threshold=5,
+                priority=RecoveryPriority.CRITICAL,
+                fallback_operations=["reduce_concurrency", "cleanup_resources"],
+                conditions={"require_manual_approval": False}
+            ),
+            RecoveryRule(
+                name="syntax_error_fallback",
+                error_patterns=["syntax", "grammar", "invalid"],
+                error_types=[ErrorType.SYNTAX_ERROR],
+                strategy=RecoveryStrategy.FALLBACK_OPERATION,
+                max_attempts=2,
+                base_delay=0.5,
+                max_delay=2.0,
+                backoff_multiplier=1.0,
+                success_threshold=0.9,
+                circuit_breaker_threshold=20,
+                priority=RecoveryPriority.MEDIUM,
+                fallback_operations=["rewrite_query", "use_alternative_syntax"],
+                conditions={"auto_fix_enabled": True}
+            ),
+            RecoveryRule(
+                name="permission_escalation",
+                error_patterns=["permission", "access", "denied", "unauthorized"],
+                error_types=[ErrorType.PERMISSION_ERROR],
+                strategy=RecoveryStrategy.MANUAL_INTERVENTION,
+                max_attempts=1,
+                base_delay=0.0,
+                max_delay=0.0,
+                backoff_multiplier=1.0,
+                success_threshold=1.0,
+                circuit_breaker_threshold=1,
+                priority=RecoveryPriority.HIGH,
+                fallback_operations=["request_elevated_privileges", "use_service_account"],
+                conditions={"require_admin_approval": True}
+            )
+        ]
+
+        for rule in default_rules:
+            self.recovery_rules[rule.name] = rule
+
+    async def add_recovery_rule(self, rule: RecoveryRule) -> bool:
+        """添加恢复规则"""
+        async with self._lock:
+            self.recovery_rules[rule.name] = rule
+            logger.info(f"Added recovery rule: {rule.name}")
+            return True
+
+    async def remove_recovery_rule(self, rule_name: str) -> bool:
+        """移除恢复规则"""
+        async with self._lock:
+            if rule_name in self.recovery_rules:
+                del self.recovery_rules[rule_name]
+                logger.info(f"Removed recovery rule: {rule_name}")
+                return True
+            return False
+
+    def _classify_error(self, error: Exception, operation: str) -> ErrorType:
+        """分类错误类型"""
+        error_message = str(error).lower()
+
+        # 连接相关错误
+        if any(keyword in error_message for keyword in ["connection", "connect", "host", "network"]):
+            return ErrorType.CONNECTION_ERROR
+
+        # 超时错误
+        if any(keyword in error_message for keyword in ["timeout", "time out", "timed out"]):
+            return ErrorType.TIMEOUT_ERROR
+
+        # 语法错误
+        if any(keyword in error_message for keyword in ["syntax", "grammar", "invalid", "parse"]):
+            return ErrorType.SYNTAX_ERROR
+
+        # 权限错误
+        if any(keyword in error_message for keyword in ["permission", "access", "denied", "unauthorized"]):
+            return ErrorType.PERMISSION_ERROR
+
+        # 资源错误
+        if any(keyword in error_message for keyword in ["memory", "disk", "space", "resource", "limit"]):
+            return ErrorType.RESOURCE_ERROR
+
+        # 数据错误
+        if any(keyword in error_message for keyword in ["duplicate", "constraint", "foreign key", "null"]):
+            return ErrorType.DATA_ERROR
+
+        # 系统错误
+        if any(keyword in error_message for keyword in ["system", "internal", "server"]):
+            return ErrorType.SYSTEM_ERROR
+
+        return ErrorType.UNKNOWN_ERROR
+
+    def _find_matching_rules(self, error_type: ErrorType, error_message: str) -> List[RecoveryRule]:
+        """查找匹配的恢复规则"""
+        matching_rules = []
+        error_msg_lower = error_message.lower()
+
+        for rule in self.recovery_rules.values():
+            if not rule.enabled:
+                continue
+
+            # 检查错误类型匹配
+            if error_type in rule.error_types:
+                matching_rules.append(rule)
+                continue
+
+            # 检查错误模式匹配
+            if any(pattern in error_msg_lower for pattern in rule.error_patterns):
+                matching_rules.append(rule)
+                continue
+
+        # 按优先级排序
+        priority_order = {
+            RecoveryPriority.CRITICAL: 0,
+            RecoveryPriority.HIGH: 1,
+            RecoveryPriority.MEDIUM: 2,
+            RecoveryPriority.LOW: 3
+        }
+
+        matching_rules.sort(key=lambda r: priority_order.get(r.priority, 4))
+        return matching_rules
+
+    def _calculate_delay(self, rule: RecoveryRule, attempt: int) -> float:
+        """计算重试延迟"""
+        if rule.strategy == RecoveryStrategy.IMMEDIATE_RETRY:
+            return 0.0
+        elif rule.strategy == RecoveryStrategy.LINEAR_BACKOFF:
+            delay = rule.base_delay * attempt
+        elif rule.strategy == RecoveryStrategy.EXPONENTIAL_BACKOFF:
+            delay = rule.base_delay * (rule.backoff_multiplier ** (attempt - 1))
+        else:
+            delay = rule.base_delay
+
+        # 添加抖动
+        jitter = random.uniform(0.8, 1.2)
+        delay *= jitter
+
+        return min(delay, rule.max_delay)
+
+    def _get_circuit_breaker(self, operation: str) -> CircuitBreaker:
+        """获取或创建熔断器"""
+        if operation not in self.circuit_breakers:
+            self.circuit_breakers[operation] = CircuitBreaker(
+                name=operation,
+                failure_threshold=5,
+                success_threshold=3,
+                timeout=60.0
+            )
+        return self.circuit_breakers[operation]
+
+    async def _execute_with_recovery(
+        self,
+        operation_func: Callable[..., Awaitable[Any]],
+        rule: RecoveryRule,
+        operation_name: str,
+        *args,
+        **kwargs
+    ) -> RecoveryResult:
+        """执行带恢复机制的操作"""
+        attempts = []
+        start_time = time.time()
+        recovery_id = f"recovery_{int(time.time() * 1000)}"
+
+        circuit_breaker = self._get_circuit_breaker(operation_name)
+
+        async with self._lock:
+            self.active_recoveries[recovery_id] = {
+                "rule": rule.name,
+                "operation": operation_name,
+                "start_time": start_time,
+                "attempts": 0
+            }
+
+        try:
+            for attempt in range(1, rule.max_attempts + 1):
+                # 检查熔断器状态
+                if not circuit_breaker.should_allow_request():
+                    error_msg = f"Circuit breaker is open for operation: {operation_name}"
+                    logger.warn(error_msg)
+
+                    attempt_record = RecoveryAttempt(
+                        attempt_id=f"{recovery_id}_attempt_{attempt}",
+                        rule_name=rule.name,
+                        strategy=rule.strategy,
+                        delay=0.0,
+                        timestamp=datetime.now(),
+                        success=False,
+                        error=error_msg
+                    )
+                    attempts.append(attempt_record)
+                    break
+
+                # 计算延迟
+                delay = self._calculate_delay(rule, attempt) if attempt > 1 else 0.0
+
+                if delay > 0:
+                    logger.info(f"Recovery attempt {attempt} for {operation_name}, waiting {delay:.2f}s")
+                    await asyncio.sleep(delay)
+
+                attempt_start = time.time()
+                attempt_record = RecoveryAttempt(
+                    attempt_id=f"{recovery_id}_attempt_{attempt}",
+                    rule_name=rule.name,
+                    strategy=rule.strategy,
+                    delay=delay,
+                    timestamp=datetime.now(),
+                    success=False
+                )
+
+                try:
+                    # 更新活跃恢复状态
+                    async with self._lock:
+                        if recovery_id in self.active_recoveries:
+                            self.active_recoveries[recovery_id]["attempts"] = attempt
+
+                    # 执行操作
+                    result = await operation_func(*args, **kwargs)
+
+                    # 记录成功
+                    attempt_record.success = True
+                    attempt_record.duration = time.time() - attempt_start
+                    attempts.append(attempt_record)
+
+                    circuit_breaker.record_success()
+
+                    logger.info(f"Recovery successful after {attempt} attempts for {operation_name}")
+
+                    return RecoveryResult(
+                        success=True,
+                        attempts_used=attempt,
+                        total_duration=time.time() - start_time,
+                        final_error=None,
+                        recovery_strategy_used=rule.strategy,
+                        attempts=attempts,
+                        metadata={"result": result}
+                    )
+
+                except Exception as e:
+                    # 记录失败
+                    attempt_record.error = str(e)
+                    attempt_record.duration = time.time() - attempt_start
+                    attempts.append(attempt_record)
+
+                    circuit_breaker.record_failure()
+
+                    logger.warn(f"Recovery attempt {attempt} failed for {operation_name}: {e}")
+
+                    # 如果是最后一次尝试，不再重试
+                    if attempt == rule.max_attempts:
+                        break
+
+            # 所有尝试都失败了
+            return RecoveryResult(
+                success=False,
+                attempts_used=len(attempts),
+                total_duration=time.time() - start_time,
+                final_error=attempts[-1].error if attempts else "No attempts made",
+                recovery_strategy_used=rule.strategy,
+                attempts=attempts,
+                metadata={}
+            )
+
+        finally:
+            # 清理活跃恢复记录
+            async with self._lock:
+                if recovery_id in self.active_recoveries:
+                    del self.active_recoveries[recovery_id]
+
+    async def recover_operation(
+        self,
+        operation_func: Callable[..., Awaitable[Any]],
+        operation_name: str,
+        error: Exception,
+        operation_metadata: Optional[Dict[str, Any]] = None,
+        *args,
+        **kwargs
+    ) -> RecoveryResult:
+        """恢复操作"""
+        # 分类错误
+        error_type = self._classify_error(error, operation_name)
+        error_message = str(error)
+
+        # 记录错误历史
+        self.error_history.append({
+            "operation": operation_name,
+            "error_type": error_type.value,
+            "error_message": error_message,
+            "timestamp": datetime.now().isoformat()
+        })
+
+        # 查找匹配的恢复规则
+        matching_rules = self._find_matching_rules(error_type, error_message)
+
+        if not matching_rules:
+            logger.warn(f"No recovery rules found for error in operation: {operation_name}")
+            return RecoveryResult(
+                success=False,
+                attempts_used=0,
+                total_duration=0.0,
+                final_error=f"No recovery strategy available for error: {error}",
+                recovery_strategy_used=None,
+                attempts=[],
+                metadata={"no_rules_found": True}
+            )
+
+        # 尝试使用第一个匹配的规则进行恢复
+        rule = matching_rules[0]
+        logger.info(f"Attempting recovery for {operation_name} using rule: {rule.name}")
+
+        try:
+            result = await self._execute_with_recovery(
+                operation_func, rule, operation_name, *args, **kwargs
+            )
+
+            # 更新统计信息
+            await self._update_recovery_statistics(rule.name, result)
+
+            return result
+
+        except Exception as recovery_error:
+            logger.error(f"Recovery failed for {operation_name}: {recovery_error}")
+            return RecoveryResult(
+                success=False,
+                attempts_used=0,
+                total_duration=0.0,
+                final_error=f"Recovery process failed: {recovery_error}",
+                recovery_strategy_used=rule.strategy,
+                attempts=[],
+                metadata={"recovery_error": str(recovery_error)}
+            )
+
+    async def _update_recovery_statistics(self, rule_name: str, result: RecoveryResult):
+        """更新恢复统计信息"""
+        async with self._lock:
+            if rule_name not in self.recovery_statistics:
+                self.recovery_statistics[rule_name] = {
+                    "total_attempts": 0,
+                    "successful_recoveries": 0,
+                    "failed_recoveries": 0,
+                    "average_attempts": 0.0,
+                    "average_duration": 0.0,
+                    "last_used": None
+                }
+
+            stats = self.recovery_statistics[rule_name]
+            stats["total_attempts"] += 1
+            stats["last_used"] = datetime.now().isoformat()
+
+            if result.success:
+                stats["successful_recoveries"] += 1
+            else:
+                stats["failed_recoveries"] += 1
+
+            # 更新平均值
+            total_recoveries = stats["successful_recoveries"] + stats["failed_recoveries"]
+            if total_recoveries > 0:
+                stats["average_attempts"] = (
+                    stats["average_attempts"] * (total_recoveries - 1) + result.attempts_used
+                ) / total_recoveries
+
+                stats["average_duration"] = (
+                    stats["average_duration"] * (total_recoveries - 1) + result.total_duration
+                ) / total_recoveries
+
+    def get_recovery_statistics(self) -> Dict[str, Any]:
+        """获取恢复统计信息"""
+        return {
+            "rules": dict(self.recovery_statistics),
+            "circuit_breakers": {
+                name: {
+                    "state": breaker.state.value,
+                    "failure_count": breaker.failure_count,
+                    "success_count": breaker.success_count,
+                    "last_failure_time": breaker.last_failure_time.isoformat() if breaker.last_failure_time else None
+                }
+                for name, breaker in self.circuit_breakers.items()
+            },
+            "error_history_count": len(self.error_history),
+            "active_recoveries": len(self.active_recoveries)
+        }
+
+    def get_error_analysis(self, hours: int = 24) -> Dict[str, Any]:
+        """获取错误分析"""
+        cutoff_time = datetime.now() - timedelta(hours=hours)
+        recent_errors = [
+            error for error in self.error_history
+            if datetime.fromisoformat(error["timestamp"]) > cutoff_time
+        ]
+
+        # 按错误类型分组
+        error_types = defaultdict(int)
+        error_operations = defaultdict(int)
+        error_patterns = defaultdict(int)
+
+        for error in recent_errors:
+            error_types[error["error_type"]] += 1
+            error_operations[error["operation"]] += 1
+
+            # 简单的错误模式分析
+            message = error["error_message"].lower()
+            if "connection" in message:
+                error_patterns["connection_issues"] += 1
+            elif "timeout" in message:
+                error_patterns["timeout_issues"] += 1
+            elif "permission" in message:
+                error_patterns["permission_issues"] += 1
+            elif "syntax" in message:
+                error_patterns["syntax_issues"] += 1
+
+        return {
+            "time_range_hours": hours,
+            "total_errors": len(recent_errors),
+            "error_types": dict(error_types),
+            "error_operations": dict(error_operations),
+            "error_patterns": dict(error_patterns),
+            "recommendations": self._generate_recommendations(error_types, error_patterns)
+        }
+
+    def _generate_recommendations(
+        self,
+        error_types: Dict[str, int],
+        error_patterns: Dict[str, int]
+    ) -> List[str]:
+        """生成改进建议"""
+        recommendations = []
+
+        if error_patterns.get("connection_issues", 0) > 5:
+            recommendations.append("考虑增加连接池大小或检查网络稳定性")
+
+        if error_patterns.get("timeout_issues", 0) > 3:
+            recommendations.append("建议增加操作超时时间或优化查询性能")
+
+        if error_patterns.get("permission_issues", 0) > 2:
+            recommendations.append("检查数据库用户权限配置")
+
+        if error_patterns.get("syntax_issues", 0) > 1:
+            recommendations.append("加强SQL查询验证机制")
+
+        total_errors = sum(error_types.values())
+        if total_errors > 10:
+            recommendations.append("错误频率较高，建议进行系统健康检查")
+
+        return recommendations if recommendations else ["系统运行稳定，暂无特殊建议"]
+
+
+# 全局错误恢复管理器实例
+_error_recovery_manager = None
+
+
+def get_error_recovery_manager() -> ErrorRecoveryManager:
+    """获取全局错误恢复管理器实例"""
+    global _error_recovery_manager
+    if _error_recovery_manager is None:
+        _error_recovery_manager = ErrorRecoveryManager()
+    return _error_recovery_manager
+
+
+# 装饰器函数
+def with_error_recovery(
+    operation_name: str,
+    operation_metadata: Optional[Dict[str, Any]] = None
+):
+    """错误恢复装饰器"""
+    def decorator(func: Callable[..., Awaitable[Any]]):
+        async def wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                recovery_manager = get_error_recovery_manager()
+                recovery_result = await recovery_manager.recover_operation(
+                    func, operation_name, e, operation_metadata, *args, **kwargs
+                )
+
+                if recovery_result.success:
+                    return recovery_result.metadata.get("result")
+                else:
+                    # 恢复失败，重新抛出原始错误
+                    raise e
+
+        return wrapper
+    return decorator

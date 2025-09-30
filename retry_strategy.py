@@ -254,8 +254,11 @@ class SmartRetryStrategy:
                 )
 
             except Exception as error:
+                # 净化错误消息，避免格式化问题
+                error_message = str(error).replace('%', '%%')  # 转义%字符
+
                 classified_error = error if isinstance(error, MySQLMCPError) else MySQLMCPError(
-                    str(error),
+                    error_message,
                     ErrorCategory.UNKNOWN,
                     ErrorSeverity.MEDIUM
                 )

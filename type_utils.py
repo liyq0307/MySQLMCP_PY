@@ -151,8 +151,11 @@ class MySQLMCPError(Exception):
         context: Optional[ErrorContext] = None,
         original_error: Optional[Exception] = None
     ):
-        super().__init__(message)
-        self._message = message  # 内部存储消息
+        # 净化消息以避免格式化问题
+        sanitized_message = str(message).replace('%', '%%') if message else ''
+
+        super().__init__(sanitized_message)
+        self._message = sanitized_message  # 内部存储消息
         self.category = category
         self.severity = severity
         self.context = context
@@ -174,8 +177,9 @@ class MySQLMCPError(Exception):
     @message.setter
     def message(self, value: str):
         """设置错误消息，同时更新Exception的args"""
-        self._message = value
-        self.args = (value,)
+        sanitized_value = str(value).replace('%', '%%') if value else ''
+        self._message = sanitized_value
+        self.args = (sanitized_value,)
 
     def _is_recoverable(self, category: ErrorCategory) -> bool:
         """判断错误是否可恢复"""
@@ -303,6 +307,7 @@ class ReportConfig(BaseModel):
     description: Optional[str] = None
     queries: List[ReportQuery]
     options: Optional[ExportOptions] = None
+    performance_metrics: Optional[Dict[str, Any]] = None
 
 
 class DuplicateCheckConfig(BaseModel):

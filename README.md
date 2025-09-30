@@ -168,10 +168,6 @@ MySQL MCP Enterprise Edition v1.0.0
 
 └── 📁 Logging System (日志系统)
     ├── loggers/
-    │   ├── __init__.py
-    │   ├── security_logger.py     # 🔒 安全日志
-    │   └── structured_logger.py   # 📊 结构化日志
-    └── logging/
         ├── __init__.py
         ├── security_logger.py     # 🔒 安全日志
         └── structured_logger.py   # 📊 结构化日志

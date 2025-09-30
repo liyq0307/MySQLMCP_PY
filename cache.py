@@ -1171,6 +1171,10 @@ class CacheManager(MemoryPressureObserver):
             for cache in self.caches.values():
                 cache.adjust_for_memory_pressure(pressure)
 
+    def adjust_for_memory_pressure(self, pressure_level: float = 0.9) -> None:
+        """调整缓存以应对内存压力"""
+        self.on_pressure_change(pressure_level)
+
     async def get(self, region: CacheRegion, key: str) -> Optional[Any]:
         """从指定区域获取缓存值"""
         cache = self.caches.get(region)

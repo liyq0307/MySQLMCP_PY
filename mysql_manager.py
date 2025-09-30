@@ -16,7 +16,7 @@ MySQL 高级管理器 - 企业级数据库操作核心
 import asyncio
 import re
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Tuple
 from datetime import datetime
 
 try:
@@ -159,8 +159,14 @@ class MySQLManager:
             re.compile(r'\bLOAD\s+DATA\b', re.IGNORECASE),
         ]
 
-        # 表名验证模式
-        self.table_name_pattern = re.compile(r'^[a-zA-Z0-9_-]+$')
+        # 表名验证模式 - 支持更多MySQL有效字符，但仍防止SQL注入
+        # 允许：字母、数字、下划线、连字符、美元符号
+        # 使用更安全的正则表达式编译选项避免引擎错误
+        try:
+            self.table_name_pattern = re.compile(r'^[a-zA-Z0-9_$-]+$', re.UNICODE)
+        except (TypeError, AttributeError):
+            # 如果正则表达式编译失败，使用更简单的模式
+            self.table_name_pattern = re.compile(r'^[a-zA-Z0-9_$-]+$')
 
         # 内存清理相关
         self.last_memory_cleanup_time = 0
@@ -389,12 +395,12 @@ class MySQLManager:
             ErrorSeverity.HIGH
         )
 
-        logger.error('操作重试失败', 'MySQLManager', final_error, {
+        logger.error('操作重试失败', 'MySQLManager', context={
             'operation': operation_name,
             'attempts': result.attempts,
             'total_delay': result.total_delay,
             'session_id': self.session_id
-        })
+        }, error=final_error)
 
         raise final_error
 
@@ -493,23 +499,79 @@ class MySQLManager:
         @param table_name - 要验证的表名
         @throws {Error} 当表名无效或过长时抛出
         """
-        if not self.table_name_pattern.match(table_name):
+        # 检查输入是否为空或无效
+        if not table_name or not isinstance(table_name, str):
             error = MySQLMCPError(
-                StringConstants.MSG_INVALID_TABLE_NAME,
+                "表名不能为空且必须是字符串类型",
                 ErrorCategory.VALIDATION_ERROR,
                 ErrorSeverity.MEDIUM
             )
             safe_error = ErrorHandler.safe_error(error, 'validate_table_name')
             raise MySQLMCPError(safe_error.message, ErrorCategory.VALIDATION_ERROR, ErrorSeverity.MEDIUM)
 
-        if len(table_name) > getattr(DefaultConfig, 'MAX_TABLE_NAME_LENGTH', 64):
+        # 尝试匹配表名模式，使用异常处理防止正则表达式错误
+        try:
+            if not self.table_name_pattern.match(table_name):
+                # 如果正则表达式不匹配，使用手动验证作为后备
+                if not self._validate_table_name_manually(table_name):
+                    error = MySQLMCPError(
+                        f"{StringConstants.MSG_INVALID_TABLE_NAME}: {table_name}",
+                        ErrorCategory.VALIDATION_ERROR,
+                        ErrorSeverity.MEDIUM
+                    )
+                    safe_error = ErrorHandler.safe_error(error, 'validate_table_name')
+                    raise MySQLMCPError(safe_error.message, ErrorCategory.VALIDATION_ERROR, ErrorSeverity.MEDIUM)
+        except (TypeError, AttributeError, Exception) as e:
+            # 处理正则表达式匹配过程中的任何错误，使用手动验证
+            logger.warn(f"正则表达式验证失败，使用手动验证: {str(e)}")
+            if not self._validate_table_name_manually(table_name):
+                error = MySQLMCPError(
+                    f"表名验证失败: {str(e)}",
+                    ErrorCategory.VALIDATION_ERROR,
+                    ErrorSeverity.MEDIUM
+                )
+                safe_error = ErrorHandler.safe_error(error, 'validate_table_name')
+                raise MySQLMCPError(safe_error.message, ErrorCategory.VALIDATION_ERROR, ErrorSeverity.MEDIUM)
+
+        # 检查表名长度
+        max_length = getattr(DefaultConfig, 'MAX_TABLE_NAME_LENGTH', 64)
+        if len(table_name) > max_length:
             error = MySQLMCPError(
-                StringConstants.MSG_TABLE_NAME_TOO_LONG,
+                f"{StringConstants.MSG_TABLE_NAME_TOO_LONG}: {len(table_name)} > {max_length}",
                 ErrorCategory.VALIDATION_ERROR,
                 ErrorSeverity.MEDIUM
             )
             safe_error = ErrorHandler.safe_error(error, 'validate_table_name')
             raise MySQLMCPError(safe_error.message, ErrorCategory.VALIDATION_ERROR, ErrorSeverity.MEDIUM)
+
+    def _validate_table_name_manually(self, table_name: str) -> bool:
+        """手动验证表名（正则表达式验证的后备方法）
+
+        当正则表达式验证失败时使用此方法进行基本验证。
+        提供更安全但更简单的字符检查。
+
+        @private
+        @param table_name - 要验证的表名
+        @returns 如果表名有效则返回True
+        """
+        if not table_name or not isinstance(table_name, str):
+            return False
+
+        # 检查长度
+        if len(table_name) > getattr(DefaultConfig, 'MAX_TABLE_NAME_LENGTH', 64):
+            return False
+
+        # 检查第一个字符（必须是字母或下划线）
+        if table_name and table_name[0] not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_':
+            return False
+
+        # 检查每个字符是否在允许的字符集中
+        allowed_chars = set('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$-')
+        for char in table_name:
+            if char not in allowed_chars:
+                return False
+
+        return True
 
     def check_rate_limit(self, identifier: str = "default") -> None:
         """检查速率限制
@@ -601,7 +663,15 @@ class MySQLManager:
             """
 
             query_result = await self.execute_query(exists_query, [table_name])
-            exists = bool(query_result and query_result[0] and query_result[0].get('count', 0) > 0)
+            if query_result and query_result[0]:
+                first_row = query_result[0]
+                if isinstance(first_row, dict):
+                    exists = bool(first_row.get('count', 0) > 0)
+                else:
+                    # 兼容元组结果的情况
+                    exists = bool(first_row[0] > 0 if len(first_row) > 0 else False)
+            else:
+                exists = False
             result = exists
             await self.cache_manager.set(CacheRegion.TABLE_EXISTS, cache_key, result)
             self.metrics.cache_misses += 1
@@ -721,25 +791,119 @@ class MySQLManager:
 
         try:
             async with connection.cursor() as cursor:
-                # 防御性参数验证：检查参数数量与查询中的占位符数量是否匹配
-                if params is not None:
-                    placeholder_count = query.count('%s')
-                    param_count = len(params)
-                    if placeholder_count != param_count:
+                # 标准化查询占位符格式
+                processed_query, processed_params = self.normalize_query_placeholders(query, params)
+
+                try:
+                    await cursor.execute(processed_query, processed_params)
+                except Exception as db_error:
+                    # 检查是否是格式字符串错误
+                    error_str = str(db_error)
+                    if "not enough arguments for format string" in error_str:
+                        # 提供更详细的调试信息
                         raise MySQLMCPError(
-                            f"参数数量不匹配：查询包含 {placeholder_count} 个占位符，但提供了 {param_count} 个参数",
+                            f"SQL占位符参数不匹配: 查询='{processed_query[:100]}...', "
+                            f"参数数量={len(processed_params) if processed_params else 0}, "
+                            f"原错误: {error_str}",
                             ErrorCategory.SYNTAX_ERROR,
                             ErrorSeverity.HIGH
                         )
+                    else:
+                        # 重新抛出其他数据库错误
+                        raise db_error
 
-                await cursor.execute(query, params)
-                if query.strip().upper().startswith(('SELECT', 'SHOW', 'DESCRIBE')):
+                if processed_query.strip().upper().startswith(('SELECT', 'SHOW', 'DESCRIBE')):
                     result = await cursor.fetchall()
-                    return self.process_query_results(result)
+                    # 将元组结果转换为字典结果
+                    dict_result = self.convert_tuples_to_dicts(result, cursor)
+                    return self.process_query_results(dict_result)
                 else:
                     return {"affected_rows": cursor.rowcount}
         finally:
             connection.close()
+
+    def normalize_query_placeholders(self, query: str, params: Optional[List[Any]] = None) -> Tuple[str, Optional[List[Any]]]:
+        """标准化查询占位符格式
+
+        将查询中的 ? 占位符转换为 %s 格式，以兼容MySQL Python驱动
+        正确处理 %% 转义字符，避免与 %s 占位符混淆
+
+        Args:
+            query: SQL查询字符串
+            params: 查询参数列表
+
+        Returns:
+            (处理后的查询, 参数列表)
+        """
+        try:
+            if params is not None and len(params) > 0:
+                # 正确计算占位符数量，排除 %% 转义字符
+                # 统计 %s 占位符（不包括 %%）
+                # 使用正则表达式匹配 %s 但不匹配 %%
+                placeholder_count_s = len(re.findall(r'(?<!%)%s(?!%)', query))
+
+                # 统计 ? 占位符
+                placeholder_count_q = query.count('?')
+
+                total_placeholders = placeholder_count_s + placeholder_count_q
+
+                param_count = len(params)
+                if total_placeholders != param_count:
+                    # 使用.format()避免字符串格式化问题
+                    error_msg = "参数数量不匹配：查询包含 {} 个占位符（%s: {}, ?: {}），但提供了 {} 个参数".format(
+                        total_placeholders, placeholder_count_s, placeholder_count_q, param_count
+                    )
+                    raise MySQLMCPError(
+                        error_msg,
+                        ErrorCategory.SYNTAX_ERROR,
+                        ErrorSeverity.HIGH
+                    )
+
+                # 如果查询使用 ? 占位符，转换为 %s 格式
+                processed_query = query
+                if '?' in query:
+                    processed_query = query.replace('?', '%s')
+
+                return processed_query, params
+
+            else:
+                # 如果没有参数，我们需要确保查询中的 %% 不会被误解为格式字符串
+                # 对于没有参数的查询，我们不应该让 MySQL 驱动程序进行任何格式化
+                processed_query = query
+
+                # 如果查询包含 %% 但没有参数，我们可以安全地使用 None 作为参数
+                # 这样 MySQL 驱动程序就不会尝试进行格式字符串替换
+                return processed_query, None
+
+        except Exception as e:
+            # 添加更详细的错误信息以帮助调试
+            if isinstance(e, MySQLMCPError):
+                raise e
+            else:
+                raise MySQLMCPError(
+                    f"标准化查询占位符时发生错误: {str(e)}",
+                    ErrorCategory.SYNTAX_ERROR,
+                    ErrorSeverity.HIGH
+                )
+
+    def convert_tuples_to_dicts(self, result: Any, cursor) -> Any:
+        """将元组结果转换为字典结果
+
+        Args:
+            result: 查询结果（元组列表）
+            cursor: 数据库游标（包含列描述信息）
+
+        Returns:
+            字典格式的结果列表
+        """
+        if not result or not cursor.description:
+            return result
+
+        columns = [desc[0] for desc in cursor.description]
+        dict_result = []
+        for row in result:
+            dict_result.append(dict(zip(columns, row)))
+        return dict_result
 
     def process_query_results(self, rows: Any) -> Any:
         """处理查询结果
@@ -1055,7 +1219,23 @@ class MySQLManager:
             results = []
 
             # 验证所有查询的安全合规性
-            self.validate_queries([q['sql'] for q in queries])
+            sql_queries = []
+            for i, q in enumerate(queries):
+                if not isinstance(q, dict):
+                    raise MySQLMCPError(
+                        f"查询 {i} 必须是字典格式",
+                        ErrorCategory.SYNTAX_ERROR,
+                        ErrorSeverity.HIGH
+                    )
+                if 'sql' not in q:
+                    raise MySQLMCPError(
+                        f"查询 {i} 缺少必需的 'sql' 键",
+                        ErrorCategory.SYNTAX_ERROR,
+                        ErrorSeverity.HIGH
+                    )
+                sql_queries.append(q['sql'])
+
+            self.validate_queries(sql_queries)
 
             # 如果提供了用户ID，检查每个查询的权限
             if user_id:
@@ -1065,10 +1245,35 @@ class MySQLManager:
             # 执行所有查询
             for query in queries:
                 async with connection.cursor() as cursor:
-                    await cursor.execute(query['sql'], query.get('params', []))
-                    if query['sql'].strip().upper().startswith(('SELECT', 'SHOW', 'DESCRIBE')):
+                    query_sql = query['sql']
+                    query_params = query.get('params', [])
+
+                    # 标准化查询占位符格式
+                    processed_query, processed_params = self.normalize_query_placeholders(query_sql, query_params)
+
+                    try:
+                        await cursor.execute(processed_query, processed_params)
+                    except Exception as db_error:
+                        # 检查是否是格式字符串错误
+                        error_str = str(db_error)
+                        if "not enough arguments for format string" in error_str:
+                            # 提供更详细的调试信息
+                            raise MySQLMCPError(
+                                f"事务中SQL占位符参数不匹配: 查询='{processed_query[:100]}...', "
+                                f"参数数量={len(processed_params) if processed_params else 0}, "
+                                f"原错误: {error_str}",
+                                ErrorCategory.SYNTAX_ERROR,
+                                ErrorSeverity.HIGH
+                            )
+                        else:
+                            # 重新抛出其他数据库错误
+                            raise db_error
+
+                    if processed_query.strip().upper().startswith(('SELECT', 'SHOW', 'DESCRIBE')):
                         result = await cursor.fetchall()
-                        processed_result = self.process_query_results(result)
+                        # 将元组结果转换为字典结果
+                        dict_result = self.convert_tuples_to_dicts(result, cursor)
+                        processed_result = self.process_query_results(dict_result)
                         results.append(processed_result)
                     else:
                         results.append({"affected_rows": cursor.rowcount})
@@ -1498,6 +1703,379 @@ class MySQLManager:
             await self.cache_manager.clear_all()
         except Exception as error:
             logger.error(f"{StringConstants.MSG_ERROR_DURING_CLEANUP}", 'MySQLManager', error)
+
+
+class ServerManager:
+    """
+    服务器管理器 - 统一管理MCP服务器的启动、关闭和生命周期
+
+    负责协调所有组件的初始化、启动、监控和优雅关闭。
+
+    @class ServerManager
+    @since 1.0.0
+    @version 1.0.0
+    """
+
+    def __init__(self, mcp_app, backup_tool, import_tool, performance_manager):
+        """初始化服务器管理器
+
+        Args:
+            mcp_app: FastMCP应用实例
+            backup_tool: 备份工具实例
+            import_tool: 导入工具实例
+            performance_manager: 性能管理器实例
+        """
+        self.mcp_app = mcp_app
+        self.backup_tool = backup_tool
+        self.import_tool = import_tool
+        self.performance_manager = performance_manager
+
+        # 关闭事件和清理标志
+        self.shutdown_event = None
+        self._cleanup_done = False
+
+        # 后台任务引用
+        self.cleanup_task = None
+        self.shutdown_task = None
+
+    def get_shutdown_event(self):
+        """获取或创建关闭事件"""
+        if self.shutdown_event is None:
+            self.shutdown_event = asyncio.Event()
+        return self.shutdown_event
+
+    async def cleanup_resources(self):
+        """异步清理所有资源"""
+        # 防止重复清理
+        if self._cleanup_done:
+            logger.info("资源已清理，跳过重复清理")
+            return
+
+        self._cleanup_done = True
+        logger.info("开始优雅关闭清理...")
+
+        cleanup_tasks = []
+
+        # 1. 停止队列管理器
+        try:
+            logger.info("正在停止队列管理器...")
+            from queue_manager import get_queue_manager
+            queue_mgr = get_queue_manager()
+            queue_mgr.stop_global_executor()
+            logger.info("队列管理器已停止")
+        except Exception as error:
+            logger.warn(f"停止队列管理器失败: {error}")
+
+        # 2. 停止进度跟踪器管理器
+        try:
+            logger.info("正在停止进度跟踪器管理器...")
+            from progress_tracker import get_progress_tracker_manager
+            progress_tracker_manager = get_progress_tracker_manager()
+            progress_tracker_manager.stop()
+            logger.info("进度跟踪器管理器已停止")
+        except Exception as error:
+            logger.warn(f"停止进度跟踪器管理器失败: {error}")
+
+        # 3. 停止增强指标收集器
+        try:
+            logger.info("正在停止增强指标收集器...")
+            from metrics import get_metrics_collector
+            enhanced_metrics = get_metrics_collector()
+            enhanced_metrics.stop_monitoring()
+            logger.info("增强指标收集器已停止")
+        except Exception as error:
+            logger.warn(f"停止增强指标收集器失败: {error}")
+
+        # 4. 停止系统监控
+        try:
+            logger.info("正在停止系统监控...")
+            from monitor import system_monitor
+            system_monitor.stop_monitoring()
+            logger.info("系统监控已停止")
+        except Exception as error:
+            logger.warn(f"停止系统监控失败: {error}")
+
+        # 5. 停止增强内存管理器
+        try:
+            logger.info("正在停止增强内存管理器...")
+            from memory_pressure_manager import get_memory_manager
+            memory_mgr = get_memory_manager()
+            await memory_mgr.stop_monitoring()
+            logger.info("增强内存管理器已停止")
+        except Exception as error:
+            logger.warn(f"停止增强内存管理器失败: {error}")
+
+        # 6. 停止错误恢复管理器
+        try:
+            logger.info("正在停止错误恢复管理器...")
+            from error_handler import get_error_recovery_manager
+            error_recovery_mgr = get_error_recovery_manager()
+            if hasattr(error_recovery_mgr, 'error_history'):
+                error_recovery_mgr.error_history.clear()
+            if hasattr(error_recovery_mgr, 'circuit_breakers'):
+                error_recovery_mgr.circuit_breakers.clear()
+            logger.info("错误恢复管理器已停止")
+        except Exception as error:
+            logger.warn(f"停止错误恢复管理器失败: {error}")
+
+        # 7. 清理备份工具队列
+        async def cleanup_backup_tool():
+            try:
+                logger.info("正在清理备份工具...")
+                self.backup_tool.clear_queue()
+                logger.info("备份工具已清理")
+            except Exception as error:
+                logger.warn(f"清理备份工具失败: {error}")
+
+        cleanup_tasks.append(cleanup_backup_tool())
+
+        # 8. 清理导入工具
+        async def cleanup_import_tool():
+            try:
+                logger.info("正在清理导入工具...")
+                if hasattr(self.import_tool, '_active_imports'):
+                    self.import_tool._active_imports.clear()
+                logger.info("导入工具已清理")
+            except Exception as error:
+                logger.warn(f"清理导入工具失败: {error}")
+
+        cleanup_tasks.append(cleanup_import_tool())
+
+        # 9. 关闭性能管理器
+        async def cleanup_performance_manager_func():
+            try:
+                logger.info("正在关闭性能管理器...")
+                if hasattr(self.performance_manager, '_performance_cache'):
+                    self.performance_manager._performance_cache.clear()
+                logger.info("性能管理器已关闭")
+            except Exception as error:
+                logger.warn(f"关闭性能管理器失败: {error}")
+
+        cleanup_tasks.append(cleanup_performance_manager_func())
+
+        # 10. 关闭MySQL连接管理器（最后关闭，因为其他组件可能依赖它）
+        async def cleanup_mysql_manager():
+            try:
+                logger.info("正在关闭MySQL管理器...")
+                await mysql_manager.close()
+                logger.info("MySQL管理器已关闭")
+            except Exception as error:
+                logger.warn(f"关闭MySQL管理器失败: {error}")
+
+        cleanup_tasks.append(cleanup_mysql_manager())
+
+        # 11. 等待所有清理任务完成（带超时）
+        if cleanup_tasks:
+            logger.info(f"准备执行 {len(cleanup_tasks)} 个异步清理任务...")
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                    timeout=15.0  # 15秒超时
+                )
+                logger.info(f"所有清理任务已完成，结果数: {len(results)}")
+
+                # 检查是否有任务失败
+                failed_count = sum(1 for r in results if isinstance(r, Exception))
+                if failed_count > 0:
+                    logger.warn(f"有 {failed_count} 个清理任务失败")
+                    for i, r in enumerate(results):
+                        if isinstance(r, Exception):
+                            logger.warn(f"任务 {i+1} 失败: {r}")
+            except asyncio.TimeoutError:
+                logger.warn("清理超时，已达到清理超时时间，可能有一些资源未被正确清理")
+            except Exception as error:
+                logger.warn(f"清理过程中出错: {error}")
+                import traceback
+                logger.warn(traceback.format_exc())
+        else:
+            logger.warn("没有异步清理任务需要执行")
+
+        # 12. 强制垃圾回收
+        try:
+            import gc
+            collected = gc.collect()
+            logger.info(f"垃圾回收已完成，回收了 {collected} 个对象")
+        except Exception as error:
+            logger.warn(f"垃圾回收失败: {error}")
+
+        logger.info("优雅关闭已完成")
+
+    def setup_signal_handlers(self):
+        """设置信号处理器"""
+        import signal
+        import sys
+
+        def signal_handler(signum, frame):
+            """同步信号处理函数"""
+            logger.info(f"\n{StringConstants.MSG_SIGNAL_RECEIVED} {signum}, {StringConstants.MSG_GRACEFUL_SHUTDOWN}")
+
+            # 设置关闭事件
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    event = self.get_shutdown_event()
+                    loop.call_soon_threadsafe(event.set)
+            except Exception as e:
+                logger.warn(f"设置关闭事件失败: {e}")
+                sys.exit(0)
+
+        try:
+            signal.signal(signal.SIGINT, signal_handler)
+            signal.signal(signal.SIGTERM, signal_handler)
+        except (OSError, ValueError) as e:
+            logger.warn(f"设置信号处理器失败: {e}")
+
+    async def start_server(self):
+        """启动MySQL MCP服务器"""
+        try:
+            logger.info("=== 服务器启动开始 ===")
+
+            # 初始化关闭事件
+            shutdown_event = self.get_shutdown_event()
+            logger.info("关闭事件已初始化")
+
+            # 保存当前事件循环的引用
+            loop = asyncio.get_running_loop()
+            logger.info("事件循环引用已保存")
+
+            # 启动进度跟踪器管理器
+            from progress_tracker import get_progress_tracker_manager
+            progress_tracker_manager = get_progress_tracker_manager()
+            progress_tracker_manager.start()
+            logger.info("进度跟踪器管理器已启动")
+
+            # 启动增强指标收集器
+            from metrics import get_metrics_collector, AlertRule, AlertLevel
+            enhanced_metrics = get_metrics_collector()
+
+            # 添加一些默认告警规则
+            default_alerts = [
+                AlertRule(
+                    name="high_cpu_usage",
+                    metric_name="cpu_usage",
+                    condition=">",
+                    threshold=80,
+                    level=AlertLevel.WARNING,
+                    description="CPU使用率过高"
+                ),
+                AlertRule(
+                    name="high_memory_usage",
+                    metric_name="memory_usage",
+                    condition=">",
+                    threshold=8 * 1024 * 1024 * 1024,  # 8GB
+                    level=AlertLevel.WARNING,
+                    description="内存使用量过高"
+                ),
+                AlertRule(
+                    name="too_many_slow_queries",
+                    metric_name="slow_query_count",
+                    condition=">",
+                    threshold=10,
+                    level=AlertLevel.ERROR,
+                    description="慢查询数量过多"
+                )
+            ]
+
+            for alert in default_alerts:
+                enhanced_metrics.add_alert_rule(alert)
+
+            enhanced_metrics.start_monitoring()
+            logger.info("增强指标收集器已启动")
+
+            # 初始化错误恢复管理器
+            from error_handler import get_error_recovery_manager
+            error_recovery_manager = get_error_recovery_manager()
+            logger.info("错误恢复管理器已使用默认规则初始化")
+
+            # 初始化增强内存管理器
+            from memory_pressure_manager import get_memory_manager
+            memory_mgr = get_memory_manager()
+            await memory_mgr.start_monitoring()
+            logger.info("增强内存管理器已初始化并开始监控")
+
+            # 启动系统监控
+            from monitor import system_monitor
+            system_monitor.start_monitoring()
+            logger.info("系统监控已启动")
+
+            # 定期清理性能数据（每10分钟清理一次）
+            async def cleanup_performance_data():
+                while not shutdown_event.is_set():
+                    try:
+                        await asyncio.wait_for(
+                            shutdown_event.wait(),
+                            timeout=600.0  # 10分钟
+                        )
+                    except asyncio.TimeoutError:
+                        try:
+                            system_monitor.cleanup_performance_data()
+                            logger.info("性能数据已清理")
+                        except Exception as error:
+                            logger.warn(f"清理性能数据失败: {error}")
+                    except Exception as error:
+                        logger.warn(f"清理任务错误: {error}")
+                        break
+
+            # 启动后台清理任务
+            self.cleanup_task = asyncio.create_task(cleanup_performance_data())
+            logger.info("后台清理任务已启动")
+
+            # 创建关闭监听任务
+            async def shutdown_monitor():
+                await shutdown_event.wait()
+                logger.error("收到关闭信号，开始优雅关闭...")
+                await self.cleanup_resources()
+
+            self.shutdown_task = asyncio.create_task(shutdown_monitor())
+
+            logger.info(StringConstants.MSG_SERVER_RUNNING)
+
+            # 并发运行服务器和关闭监听器
+            logger.info("启动MCP服务器...")
+            done, pending = await asyncio.wait(
+                [
+                    asyncio.create_task(self.mcp_app.run_async()),
+                    self.shutdown_task
+                ],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            logger.info(f"服务器任务完成。完成: {len(done)}，待处理: {len(pending)}")
+
+            # 取消剩余任务
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        except KeyboardInterrupt:
+            logger.error("收到键盘中断，触发优雅关闭...")
+            shutdown_event = self.get_shutdown_event()
+            if not shutdown_event.is_set():
+                shutdown_event.set()
+                if self.shutdown_task and not self.shutdown_task.done():
+                    try:
+                        await asyncio.wait_for(self.shutdown_task, timeout=10.0)
+                    except asyncio.TimeoutError:
+                        logger.error("shutdown_task 超时")
+                    except Exception as e:
+                        logger.error(f"shutdown_task error: {e}")
+        except asyncio.CancelledError:
+            logger.error("shutdown_task 被取消，触发优雅关闭...")
+        except Exception as error:
+            logger.error(f"服务器错误: {error}")
+            import traceback
+            logger.error(traceback.format_exc())
+        finally:
+            # 确保清理任务被取消
+            if self.cleanup_task:
+                self.cleanup_task.cancel()
+                try:
+                    await self.cleanup_task
+                except asyncio.CancelledError:
+                    pass
 
 
 # 全局MySQL管理器实例
